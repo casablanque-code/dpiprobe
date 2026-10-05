@@ -53,6 +53,15 @@ enum Cmd {
         repeats: u32,
         #[arg(long, default_value_t = 5)]
         timeout: u64,
+        /// split ClientHello into two TCP segments after N bytes (0 = off)
+        #[arg(long, default_value_t = 0)]
+        split: usize,
+        /// split ClientHello in the middle of the SNI hostname
+        #[arg(long)]
+        split_sni: bool,
+        /// pause between the two segments, ms
+        #[arg(long, default_value_t = 50)]
+        split_delay: u64,
     },
 }
 
@@ -198,18 +207,45 @@ async fn ground(server: &str, ctl: u16, id: &str) -> serde_json::Value {
     }
 }
 
-async fn attempt(server: &str, port: u16, ctl: u16, sni: &str, to: u64) -> serde_json::Value {
+struct Split {
+    at: usize,
+    sni: bool,
+    delay: u64,
+}
+
+async fn attempt(server: &str, port: u16, ctl: u16, sni: &str, to: u64, sp: &Split) -> serde_json::Value {
     let mut random = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut random);
     let id = hex(&random);
     let ch = build_client_hello(sni, &random);
+    let name = sni.as_bytes();
+    let cut: Option<usize> = if sp.sni {
+        ch.windows(name.len()).position(|w| w == name).map(|p| p + name.len() / 2)
+    } else if sp.at > 0 {
+        Some(sp.at.min(ch.len() - 1))
+    } else {
+        None
+    };
     let t0 = Instant::now();
     let mut rx = 0usize;
     let outcome: String = match timeout(Duration::from_secs(5), TcpStream::connect((server, port))).await {
         Err(_) => "connect_timeout".into(),
         Ok(Err(e)) => format!("connect_err:{:?}", e.kind()),
         Ok(Ok(mut s)) => {
-            if let Err(e) = s.write_all(&ch).await {
+            let _ = s.set_nodelay(true);
+            let sent = async {
+                match cut {
+                    Some(c) => {
+                        s.write_all(&ch[..c]).await?;
+                        s.flush().await?;
+                        sleep(Duration::from_millis(sp.delay)).await;
+                        s.write_all(&ch[c..]).await
+                    }
+                    None => s.write_all(&ch).await,
+                }
+            }
+            .await;
+            if let Err(e) = sent {
                 format!("send_err:{:?}", e.kind())
             } else {
                 let mut buf = [0u8; 4096];
@@ -229,14 +265,14 @@ async fn attempt(server: &str, port: u16, ctl: u16, sni: &str, to: u64) -> serde
     let ms = t0.elapsed().as_millis() as u64;
     sleep(Duration::from_millis(300)).await;
     let g = ground(server, ctl, &id).await;
-    json!({"sni": sni, "outcome": outcome, "rx": rx, "ms": ms, "id": id, "server": g})
+    json!({"sni": sni, "outcome": outcome, "rx": rx, "ms": ms, "split": cut, "id": id, "server": g})
 }
 
-async fn probe(server: String, port: u16, ctl: u16, csni: String, tsni: String, n: u32, to: u64) {
+async fn probe(server: String, port: u16, ctl: u16, csni: String, tsni: String, n: u32, to: u64, sp: Split) {
     for (kind, sni) in [("control", &csni), ("test", &tsni)] {
         let (mut ok, mut seen) = (0, 0);
         for _ in 0..n {
-            let mut r = attempt(&server, port, ctl, sni, to).await;
+            let mut r = attempt(&server, port, ctl, sni, to, &sp).await;
             r["kind"] = json!(kind);
             if r["outcome"] == "tls_alert" {
                 ok += 1;
@@ -261,8 +297,9 @@ async fn probe(server: String, port: u16, ctl: u16, csni: String, tsni: String, 
 async fn main() {
     match Cli::parse().cmd {
         Cmd::Server { data, ctl } => server(data, ctl).await,
-        Cmd::Probe { server, port, ctl, control_sni, test_sni, repeats, timeout } => {
-            probe(server, port, ctl, control_sni, test_sni, repeats, timeout).await
+        Cmd::Probe { server, port, ctl, control_sni, test_sni, repeats, timeout, split, split_sni, split_delay } => {
+            let sp = Split { at: split, sni: split_sni, delay: split_delay };
+            probe(server, port, ctl, control_sni, test_sni, repeats, timeout, sp).await
         }
     }
 }
