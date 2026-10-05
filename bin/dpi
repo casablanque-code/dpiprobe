@@ -120,12 +120,15 @@ dpi_start() {
 }
 
 server_on() {
-  alive "$RUN/srv.pid" && return 0
   [[ -x $BIN ]] || die "missing $BIN (run: cd $REPO && cargo build --release)"
-  pkill -f 'dpiprobe server' 2>/dev/null
+  local stamp; stamp=$(stat -c %Y "$BIN")
+  # Reuse the running server only if it was started from the current binary.
+  alive "$RUN/srv.pid" && [[ $(cat "$RUN/srv.stamp" 2>/dev/null) == "$stamp" ]] && return 0
+  server_off
   : > "$RUN/srv.log"
   ip netns exec sv nohup "$BIN" server >> "$RUN/srv.log" 2>&1 < /dev/null &
   echo $! > "$RUN/srv.pid"
+  echo "$stamp" > "$RUN/srv.stamp"
   wait_for "$RUN/srv.log" 'listening' || die "server failed to start, see: dpi log srv"
 }
 
