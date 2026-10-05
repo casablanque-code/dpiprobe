@@ -1,6 +1,16 @@
-# профиль | аргументы зонда | ожидаемый outcome теста (rst, timeout, tls_alert)
-sni-rst           | --test-sni blocked.example              | rst
-sni-rst           | --test-sni other.example                | tls_alert
-sni-rst           | --test-sni blocked.example --split-sni  | tls_alert
-sni-rst-stateful  | --test-sni blocked.example --split-sni  | rst
-sni-drop          | --test-sni blocked.example              | timeout
+# profile | dpiprobe args | expected result
+#   probe     -> tls_alert | rst | timeout
+#   depth     -> depth=N | not_blocked
+#   threshold -> cutoff=NKB | cutoff=none
+sni-rst           | probe --test-sni blocked.example --repeats 2                | rst
+sni-rst           | probe --test-sni other.example --repeats 2                  | tls_alert
+sni-rst           | probe --test-sni blocked.example --split-sni --repeats 2    | tls_alert
+sni-rst-stateful  | probe --test-sni blocked.example --split-sni --repeats 2    | rst
+sni-drop          | probe --test-sni blocked.example --repeats 2                | timeout
+sni-rst           | depth --sni blocked.example --max-pad 8                     | depth=3
+sni-rst-depth1    | depth --sni blocked.example --max-pad 8                     | depth=1
+sni-rst-depth6    | depth --sni blocked.example --max-pad 10                    | depth=6
+sni-drop-depth2   | depth --sni blocked.example --max-pad 6                     | depth=2
+sni-rst           | threshold --sni allowed.example --max-kb 32                 | cutoff=none
+thr-drop-4k       | threshold --sni allowed.example --max-kb 32                 | cutoff=4KB
+thr-rst-16k       | threshold --sni allowed.example --max-kb 32                 | cutoff=16KB

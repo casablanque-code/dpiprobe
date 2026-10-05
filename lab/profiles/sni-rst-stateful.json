@@ -1,1 +1,1 @@
-{"match": "blocked.example", "action": "rst", "rst_to": "both", "max_pkts": 3, "stateful": true, "threshold_kb": 0, "server_port": 443}
+{"desc": "Same, but reassembles the first packets (catches a split SNI)", "match": "blocked.example", "action": "rst", "rst_to": "both", "max_pkts": 3, "stateful": true, "threshold_kb": 0, "server_port": 443}

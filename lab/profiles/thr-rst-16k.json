@@ -1,0 +1,1 @@
+{"desc": "No SNI rule; injects RST after 16 KB of client upload", "match": "", "action": "rst", "rst_to": "both", "max_pkts": 3, "stateful": false, "threshold_kb": 16, "server_port": 443}

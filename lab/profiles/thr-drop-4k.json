@@ -1,0 +1,1 @@
+{"desc": "No SNI rule; freezes (drops) a flow after 4 KB of client upload", "match": "", "action": "drop", "rst_to": "both", "max_pkts": 3, "stateful": false, "threshold_kb": 4, "server_port": 443}

@@ -1,0 +1,1 @@
+{"desc": "SNI + drop, inspects the first 2 packets", "match": "blocked.example", "action": "drop", "rst_to": "both", "max_pkts": 2, "stateful": false, "threshold_kb": 0, "server_port": 443}
