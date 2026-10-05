@@ -1,0 +1,6 @@
+# профиль | аргументы зонда | ожидаемый outcome теста (rst, timeout, tls_alert)
+sni-rst           | --test-sni blocked.example              | rst
+sni-rst           | --test-sni other.example                | tls_alert
+sni-rst           | --test-sni blocked.example --split-sni  | tls_alert
+sni-rst-stateful  | --test-sni blocked.example --split-sni  | rst
+sni-drop          | --test-sni blocked.example              | timeout

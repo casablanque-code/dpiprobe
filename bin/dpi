@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# dpi - управление DPI-лабой (netns cl - dpi - sv). Справка: dpi help
+set -u
+REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+BIN=${DPI_BIN:-$REPO/target/release/dpiprobe}
+PY=${DPI_PY:-/root/lab/venv/bin/python}
+RUN=/run/dpi
+SRV=10.0.2.2
+
+die() { echo "ошибка: $*" >&2; exit 1; }
+alive() { [[ -f $1 ]] && kill -0 "$(cat "$1")" 2>/dev/null; }
+wait_for() { local i; for i in $(seq 50); do grep -q "$2" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
+nsx() { local ns=$1; shift; ip netns exec "$ns" "$@"; }
+
+read -r -d '' PYFMT <<'PY'
+import sys, json
+for l in sys.stdin:
+    try:
+        r = json.loads(l)
+    except ValueError:
+        print(l, end=''); continue
+    if 'summary' in r:
+        print("  => %-7s %s: ok %d/%d, server видел %d/%d -> %s" % (r['summary'], r['sni'], r['ok'], r['of'], r['server_seen'], r['of'], r['verdict']))
+    else:
+        g = r.get('server')
+        seen = 'ctl?' if not g else ('видел' if g.get('seen') else 'НЕ видел')
+        sp = ' split@%s' % r['split'] if r.get('split') else ''
+        print("  %-7s %-20s %-10s %5dms  server: %s%s" % (r['kind'], r['sni'], r['outcome'], r['ms'], seen, sp))
+PY
+
+read -r -d '' PYCHK <<'PY'
+import sys, json
+exp = sys.argv[1]
+ctl, tst = [], []
+for l in sys.stdin:
+    try:
+        r = json.loads(l)
+    except ValueError:
+        continue
+    if 'outcome' not in r:
+        continue
+    (ctl if r['kind'] == 'control' else tst).append(r)
+if not ctl or not tst:
+    print('FAIL нет вывода зонда'); sys.exit(1)
+bad = sorted({r['outcome'] for r in ctl} - {'tls_alert'})
+if bad:
+    print('FAIL control не прошёл: ' + ','.join(bad)); sys.exit(1)
+got = sorted({r['outcome'] for r in tst})
+seen = sum(1 for r in tst if (r.get('server') or {}).get('seen'))
+info = '%s, server видел %d/%d' % ('/'.join(got), seen, len(tst))
+if got == [exp]:
+    print('PASS ' + info)
+else:
+    print('FAIL ' + info); sys.exit(1)
+PY
+
+read -r -d '' PYCFG <<'PY'
+import sys, json
+base, out, *kv = sys.argv[1:]
+c = json.load(open(base))
+for a in kv:
+    k, _, v = a.partition('=')
+    if v in ('true', 'false'):
+        v = (v == 'true')
+    elif v.lstrip('-').isdigit():
+        v = int(v)
+    c[k] = v
+json.dump(c, open(out, 'w'))
+PY
+
+fmt() { python3 -c "$PYFMT"; }
+cfg_build() { local base=$1; shift; python3 -c "$PYCFG" "$base" "$RUN/dpi.json" "$@"; }
+cfg_show() { [[ -f $RUN/dpi.json ]] && python3 -c 'import json;c=json.load(open("/run/dpi/dpi.json"));print("  "+" ".join("%s=%s"%(k,str(v).lower() if isinstance(v,bool) else v) for k,v in c.items()))'; }
+
+lab_up() {
+  [[ -e /run/netns/cl && -e /run/netns/dpi && -e /run/netns/sv ]] && return 0
+  local n; for n in cl dpi sv; do ip netns del $n 2>/dev/null; done
+  ip netns add cl; ip netns add dpi; ip netns add sv
+  ip link add c0 type veth peer name d0
+  ip link add d1 type veth peer name s0
+  ip link set c0 netns cl; ip link set d0 netns dpi
+  ip link set d1 netns dpi; ip link set s0 netns sv
+  nsx cl ip addr add 10.0.1.2/24 dev c0
+  nsx dpi ip addr add 10.0.1.1/24 dev d0
+  nsx dpi ip addr add 10.0.2.1/24 dev d1
+  nsx sv ip addr add 10.0.2.2/24 dev s0
+  for n in cl dpi sv; do nsx $n ip link set lo up; done
+  nsx cl ip link set c0 up; nsx dpi ip link set d0 up
+  nsx dpi ip link set d1 up; nsx sv ip link set s0 up
+  nsx cl ip route add default via 10.0.1.1
+  nsx sv ip route add default via 10.0.2.1
+  nsx dpi sysctl -qw net.ipv4.ip_forward=1
+}
+
+rule_on() {
+  nsx dpi nft add table inet f
+  nsx dpi nft 'add chain inet f fw { type filter hook forward priority 0; }'
+  nsx dpi nft flush chain inet f fw
+  nsx dpi nft add rule inet f fw meta l4proto tcp queue num 0
+}
+rule_off() { nsx dpi nft flush chain inet f fw 2>/dev/null; }
+
+dpi_stop() {
+  rule_off
+  alive "$RUN/dpi.pid" && kill "$(cat "$RUN/dpi.pid")" 2>/dev/null
+  pkill -f 'lab/dpi.py' 2>/dev/null
+  rm -f "$RUN/dpi.pid"; sleep 0.2
+  return 0
+}
+
+dpi_start() {
+  [[ -f $REPO/lab/dpi.py ]] || die "нет $REPO/lab/dpi.py"
+  [[ -x $PY ]] || die "нет python для DPI: $PY (задай DPI_PY=...)"
+  dpi_stop
+  : > "$RUN/dpi.log"
+  ip netns exec dpi nohup "$PY" "$REPO/lab/dpi.py" "$RUN/dpi.json" >> "$RUN/dpi.log" 2>&1 < /dev/null &
+  echo $! > "$RUN/dpi.pid"
+  wait_for "$RUN/dpi.log" '"ev": "start"' || die "DPI не стартовал, смотри: dpi log"
+  rule_on
+}
+
+server_on() {
+  alive "$RUN/srv.pid" && return 0
+  [[ -x $BIN ]] || die "нет $BIN (cd $REPO && cargo build --release)"
+  pkill -f 'dpiprobe server' 2>/dev/null
+  : > "$RUN/srv.log"
+  ip netns exec sv nohup "$BIN" server >> "$RUN/srv.log" 2>&1 < /dev/null &
+  echo $! > "$RUN/srv.pid"
+  wait_for "$RUN/srv.log" 'listening' || die "сервер не стартовал, смотри: dpi log srv"
+}
+
+server_off() {
+  alive "$RUN/srv.pid" && kill "$(cat "$RUN/srv.pid")" 2>/dev/null
+  pkill -f 'dpiprobe server' 2>/dev/null
+  rm -f "$RUN/srv.pid"
+  return 0
+}
+
+cmd_on() {
+  local prof
+  if [[ -z ${1:-} || $1 == *=* ]]; then prof=sni-rst; else prof=$1; shift; fi
+  [[ -f $REPO/lab/profiles/$prof.json ]] || die "нет профиля '$prof' (dpi profiles)"
+  lab_up; server_on
+  cfg_build "$REPO/lab/profiles/$prof.json" "$@"
+  if [[ $# -eq 0 ]]; then echo "$prof" > "$RUN/profile"; else echo "$prof+" > "$RUN/profile"; fi
+  dpi_start
+  echo "DPI включён: $prof"; cfg_show
+}
+
+cmd_set() {
+  [[ $# -gt 0 ]] || die "пример: dpi set action=drop stateful=true max_pkts=1"
+  [[ -f $RUN/dpi.json ]] || die "сначала dpi on"
+  lab_up; server_on
+  cfg_build "$RUN/dpi.json" "$@"
+  echo "custom" > "$RUN/profile"
+  dpi_start
+  echo "DPI перезапущен"; cfg_show
+}
+
+cmd_off() { dpi_stop; echo "DPI выключен, сеть прозрачная"; }
+
+cmd_status() {
+  [[ -e /run/netns/dpi ]] && echo "lab:    up" || echo "lab:    down (dpi up)"
+  if alive "$RUN/dpi.pid"; then echo "dpi:    ON ($(cat "$RUN/profile" 2>/dev/null))"; cfg_show; else echo "dpi:    off"; fi
+  alive "$RUN/srv.pid" && echo "server: on" || echo "server: off"
+}
+
+cmd_log() {
+  local f=$RUN/dpi.log
+  [[ ${1:-} == srv ]] && { f=$RUN/srv.log; shift; }
+  if [[ ${1:-} == -f ]]; then tail -n 20 -f "$f"; else tail -n 30 "$f"; fi
+}
+
+cmd_probe() {
+  lab_up; server_on
+  [[ " $* " == *" --test-sni "* ]] || set -- --test-sni blocked.example "$@"
+  if [[ -n ${RAW:-} ]]; then nsx cl "$BIN" probe --server $SRV "$@"
+  else nsx cl "$BIN" probe --server $SRV "$@" | fmt; fi
+}
+
+cmd_test() {
+  local filter=${1:-} pass=0 fail=0 prof args exp out res st cur
+  local tests=$REPO/lab/tests.tsv
+  [[ -f $tests ]] || die "нет $tests"
+  lab_up; server_on
+  while IFS='|' read -r -u 3 prof args exp; do
+    prof=$(echo $prof); args=$(echo $args); exp=$(echo $exp)
+    [[ -z $prof || $prof == \#* ]] && continue
+    [[ -n $filter && "$prof $args" != *$filter* ]] && continue
+    cur=$(cat "$RUN/profile" 2>/dev/null)
+    if [[ $cur != "$prof" ]] || ! alive "$RUN/dpi.pid"; then
+      [[ -f $REPO/lab/profiles/$prof.json ]] || die "нет профиля '$prof' (строка теста: $args)"
+      cfg_build "$REPO/lab/profiles/$prof.json"; echo "$prof" > "$RUN/profile"; dpi_start
+    fi
+    out=$(nsx cl "$BIN" probe --server $SRV --timeout 2 --repeats 2 $args 2>&1)
+    res=$(printf '%s\n' "$out" | python3 -c "$PYCHK" "$exp")
+    st=${res%% *}
+    [[ $st == PASS ]] && pass=$((pass+1)) || fail=$((fail+1))
+    printf '%-4s %-18s %-40s want=%-9s %s\n' "$st" "$prof" "$args" "$exp" "${res#* }"
+  done 3< "$tests"
+  echo; echo "passed $pass, failed $fail"
+  [[ $fail -eq 0 ]]
+}
+
+cmd_profiles() { local f; for f in "$REPO"/lab/profiles/*.json; do echo "$(basename "$f" .json)"; echo "    $(cat "$f")"; done; }
+
+cmd_down() { dpi_stop; server_off; local n; for n in cl dpi sv; do ip netns del $n 2>/dev/null; done; echo "лаба удалена"; }
+
+cmd_help() {
+  cat <<'H'
+dpi up                    создать лабу (netns cl - dpi - sv); обычно не нужно, делается само
+dpi on [профиль] [k=v..]  включить DPI (по умолчанию sni-rst), напр. dpi on sni-drop
+dpi set k=v ..            поменять конфиг на лету, напр. dpi set stateful=true max_pkts=1
+dpi off                   выключить DPI (сеть прозрачная)
+dpi status                что сейчас включено
+dpi probe [арги зонда]    прогнать зонд из cl, напр. dpi probe --split-sni
+dpi test [фильтр]         весь набор из lab/tests.tsv, PASS/FAIL по каждой строке
+dpi profiles              список профилей (lab/profiles/*.json)
+dpi log [srv] [-f]        лог DPI или сервера
+dpi down                  всё остановить и удалить лабу
+RAW=1 dpi probe ...       сырой JSON вместо таблицы
+H
+}
+
+[[ ${1:-help} =~ ^(help|-h|--help)$ ]] && { cmd_help; exit 0; }
+[[ $EUID -eq 0 ]] || die "нужен root"
+mkdir -p "$RUN"
+c=$1; shift
+case $c in
+  up) lab_up; echo "лаба готова" ;;
+  on) cmd_on "$@" ;;
+  set) cmd_set "$@" ;;
+  off) cmd_off ;;
+  status|st) cmd_status ;;
+  probe|p) cmd_probe "$@" ;;
+  test|t) cmd_test "$@" ;;
+  profiles) cmd_profiles ;;
+  log) cmd_log "$@" ;;
+  down) cmd_down ;;
+  *) cmd_help; exit 1 ;;
+esac

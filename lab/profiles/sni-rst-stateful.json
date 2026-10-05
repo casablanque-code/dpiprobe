@@ -1,0 +1,1 @@
+{"match": "blocked.example", "action": "rst", "rst_to": "both", "max_pkts": 3, "stateful": true, "threshold_kb": 0, "server_port": 443}
