@@ -1,0 +1,1 @@
+{"match": "blocked.example", "action": "rst", "threshold_kb": 0}
