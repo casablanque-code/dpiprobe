@@ -1,0 +1,1 @@
+{"desc": "QUIC only: answer such Initials with ICMP port unreachable", "tcp": false, "quic": "sni", "quic_action": "icmp", "match": "blocked.example", "server_port": 443}

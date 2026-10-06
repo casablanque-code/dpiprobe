@@ -97,6 +97,7 @@ rule_on() {
   nsx dpi nft 'add chain inet f fw { type filter hook forward priority 0; }'
   nsx dpi nft flush chain inet f fw
   nsx dpi nft add rule inet f fw meta l4proto tcp queue num 0
+  nsx dpi nft add rule inet f fw udp dport 443 queue num 0
 }
 rule_off() { nsx dpi nft flush chain inet f fw 2>/dev/null; }
 
@@ -230,6 +231,7 @@ cmd_doctor() {
   chk "nft installed"                      'command -v nft'
   chk "python3 installed"                  'command -v python3'
   chk "DPI python has netfilterqueue+scapy ($PY)" '"$PY" -c "import netfilterqueue, scapy"'
+  chk "DPI python has cryptography (QUIC profiles)" '"$PY" -c "import cryptography"'
   chk "dpiprobe built ($BIN)"              '[[ -x $BIN ]]'
   chk "lab/dpi_sim.py present"             '[[ -f $REPO/lab/dpi_sim.py ]]'
   chk "network namespaces usable"          'ip netns list'
@@ -258,6 +260,7 @@ MEASUREMENTS (run from the client side of the lab)
                               e.g. dpi probe --split-sni      (default --test-sni blocked.example)
   dpi fingerprint [opts]      run a matrix of ClientHello perturbations and derive a middlebox profile
                               (reaction, reassembly, case, depth, window); slow: ~15 cells
+  dpi quic [opts]             UDP/QUIC 443: plain UDP, then QUIC Initials with the test and control SNI
   dpi depth [opts]            how many client packets does the DPI inspect?
   dpi threshold [opts]        after how many uploaded bytes does the DPI cut the flow?
   Every option of `dpiprobe <command> --help` works here.
@@ -266,7 +269,8 @@ TESTS
   dpi test [filter]           run lab/tests.tsv: each row is  profile | dpiprobe args | expected result
                               expected: probe -> tls_alert|rst|timeout, depth -> depth=N,
                               threshold -> cutoff=NKB|cutoff=none,
-                              fingerprint -> comma-separated traits, e.g. rst,stateless,case-sensitive,depth=3,deep-scan
+                              quic -> quic=unaffected|sni-drop|sni-icmp|blocked-all, udp=blocked,
+                              fingerprint -> comma-separated traits, e.g. rst,stateless,case-sensitive,depth=3,deep-scan,quic=unaffected
   RAW output for scripts: add --json to any measurement.
 
 TYPICAL SESSION
@@ -286,6 +290,7 @@ case $c in
   status|st) cmd_status ;;
   probe|p) run_tool probe --test-sni blocked.example "$@" ;;
   depth|d) run_tool depth --sni blocked.example "$@" ;;
+  quic|q) run_tool quic --sni blocked.example "$@" ;;
   fingerprint|fp) run_tool fingerprint --sni blocked.example "$@" ;;
   threshold|th) run_tool threshold "" "" "$@" ;;
   test|t) cmd_test "$@" ;;

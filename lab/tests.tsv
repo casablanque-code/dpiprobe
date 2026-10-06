@@ -2,6 +2,7 @@
 #   probe     -> tls_alert | rst | timeout
 #   depth     -> depth=N | not_blocked
 #   threshold -> cutoff=NKB | cutoff=none
+#   quic      -> quic=unaffected | quic=sni-drop | quic=sni-icmp | quic=blocked-all | udp=blocked
 #   fingerprint -> traits: reaction,reassembly,case,depth,scan[,evades-header-split][,sni-position-sensitive]
 sni-rst           | probe --test-sni blocked.example --repeats 2                | rst
 sni-rst           | probe --test-sni other.example --repeats 2                  | tls_alert
@@ -15,9 +16,16 @@ sni-drop-depth2   | depth --sni blocked.example --max-pad 6                     
 sni-rst           | threshold --sni allowed.example --max-kb 32                 | cutoff=none
 thr-drop-4k       | threshold --sni allowed.example --max-kb 32                 | cutoff=4KB
 thr-rst-16k       | threshold --sni allowed.example --max-kb 32                 | cutoff=16KB
-sni-rst           | fingerprint --sni blocked.example                           | rst,stateless,case-sensitive,depth=3,deep-scan
-sni-rst-stateful  | fingerprint --sni blocked.example                           | rst,stateful,case-sensitive,depth=3,deep-scan
-sni-rst-depth1    | fingerprint --sni blocked.example                           | rst,stateless,case-sensitive,depth=1,deep-scan,evades-header-split
-sni-rst-depth6    | fingerprint --sni blocked.example                           | rst,stateless,case-sensitive,depth>4,deep-scan
-sni-drop          | fingerprint --sni blocked.example                           | drop,stateless,case-sensitive,depth=3,deep-scan
-sni-drop-depth2   | fingerprint --sni blocked.example                           | drop,stateless,case-sensitive,depth=2,deep-scan
+sni-rst           | fingerprint --sni blocked.example                           | rst,stateless,case-sensitive,depth=3,deep-scan,quic=unaffected
+sni-rst-stateful  | fingerprint --sni blocked.example                           | rst,stateful,case-sensitive,depth=3,deep-scan,quic=unaffected
+sni-rst-depth1    | fingerprint --sni blocked.example                           | rst,stateless,case-sensitive,depth=1,deep-scan,evades-header-split,quic=unaffected
+sni-rst-depth6    | fingerprint --sni blocked.example                           | rst,stateless,case-sensitive,depth>4,deep-scan,quic=unaffected
+sni-drop          | fingerprint --sni blocked.example                           | drop,stateless,case-sensitive,depth=3,deep-scan,quic=unaffected
+sni-drop-depth2   | fingerprint --sni blocked.example                           | drop,stateless,case-sensitive,depth=2,deep-scan,quic=unaffected
+sni-rst           | quic --sni blocked.example --repeats 2                      | quic=unaffected
+quic-sni-drop     | quic --sni blocked.example --repeats 2                      | quic=sni-drop
+quic-sni-icmp     | quic --sni blocked.example --repeats 2                      | quic=sni-icmp
+quic-initial-drop | quic --sni blocked.example --repeats 2                      | quic=blocked-all
+quic-udp-drop     | quic --sni blocked.example --repeats 2                      | udp=blocked
+quic-sni-drop     | fingerprint --sni blocked.example                           | tcp=unaffected,quic=sni-drop
+sni-rst-quic-drop | fingerprint --sni blocked.example                           | rst,stateless,case-sensitive,depth=3,deep-scan,quic=sni-drop

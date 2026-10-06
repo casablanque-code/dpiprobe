@@ -1,0 +1,1 @@
+{"desc": "QUIC only: silently drop Initials whose ClientHello contains blocked.example", "tcp": false, "quic": "sni", "quic_action": "drop", "match": "blocked.example", "server_port": 443}

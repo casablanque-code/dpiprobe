@@ -6,6 +6,7 @@
 
 mod fingerprint;
 mod probe;
+mod quic;
 mod server;
 mod ui;
 mod wire;
@@ -65,6 +66,26 @@ enum Cmd {
         #[arg(long, default_value_t = 16)]
         max_pad: usize,
     },
+    /// Test QUIC (UDP 443): does a QUIC Initial with the test SNI get through? Also checks plain UDP.
+    Quic {
+        #[command(flatten)]
+        t: Target,
+        /// SNI under test
+        #[arg(long)]
+        sni: String,
+        /// SNI that should pass untouched
+        #[arg(long, default_value = "allowed.example")]
+        control_sni: String,
+        /// Attempts per group
+        #[arg(long, default_value_t = 2)]
+        repeats: u32,
+    },
+    /// Print a QUIC Initial datagram (hex) for an SNI, with fixed identifiers; used for test fixtures
+    #[command(hide = true)]
+    Initial {
+        #[arg(long)]
+        sni: String,
+    },
     /// Run a matrix of ClientHello perturbations and derive a behaviour profile of the middlebox
     Fingerprint {
         #[command(flatten)]
@@ -103,6 +124,8 @@ async fn main() {
             probe::cmd_probe(t, control_sni, test_sni, repeats, shape).await
         }
         Cmd::Depth { t, sni, control_sni, max_pad } => probe::cmd_depth(t, sni, control_sni, max_pad).await,
+        Cmd::Quic { t, sni, control_sni, repeats } => probe::cmd_quic(t, control_sni, sni, repeats).await,
+        Cmd::Initial { sni } => println!("{}", wire::hex(&quic::fixture_initial(&sni))),
         Cmd::Fingerprint { t, sni, control_sni, repeats } => {
             fingerprint::cmd_fingerprint(t, sni, control_sni, repeats).await
         }

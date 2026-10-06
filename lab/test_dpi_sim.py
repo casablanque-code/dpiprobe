@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.modules.setdefault("netfilterqueue", types.ModuleType("netfilterqueue"))
 
-from scapy.all import IP, TCP, Raw  # noqa: E402
+from scapy.all import ICMP, IP, TCP, UDP, Raw  # noqa: E402
 import dpi_sim  # noqa: E402
 
 dpi_sim.log = lambda **kw: None  # keep test output clean
@@ -32,6 +32,25 @@ class Clock:
 
     def __call__(self):
         return self.t
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def fixture(name):
+    with open(os.path.join(HERE, "testdata", name)) as f:
+        return bytes.fromhex(f.read().strip())
+
+
+def udp(payload, sport=50000, dport=443):
+    return bytes(IP(src=C, dst=S) / UDP(sport=sport, dport=dport) / Raw(payload))
+
+
+try:
+    import cryptography  # noqa: F401
+    HAVE_CRYPTO = True
+except ImportError:
+    HAVE_CRYPTO = False
 
 
 def make(**cfg):
@@ -93,6 +112,10 @@ class SimTests(unittest.TestCase):
         self.assertTrue(sim.process(pkt(flags="FA", seq=1100)))
         self.assertEqual(len(sim.blocked), 0)
 
+    def test_tcp_switch_off_leaves_tcp_alone(self):
+        sim, _, _ = make(action="drop", tcp=False)
+        self.assertTrue(sim.process(pkt(b"hello blocked.example")))
+
     def test_gc_expires_flows_and_blocked(self):
         sim, _, clock = make(action="drop", flow_ttl=10, blocked_ttl=20, gc_interval=1)
         sim.process(pkt(b"idle flow", sport=40001))
@@ -105,6 +128,43 @@ class SimTests(unittest.TestCase):
         clock.t = 40
         sim.process(pkt(b"tick", sport=40003))
         self.assertEqual(len(sim.blocked), 0)
+
+
+@unittest.skipUnless(HAVE_CRYPTO, "needs the cryptography package")
+class QuicTests(unittest.TestCase):
+    """The fixtures are Initials built by the Rust probe, so these also cross-check
+    the Rust encryption against this independent Python decryption."""
+
+    def test_decrypts_rust_built_initial(self):
+        data = dpi_sim.quic_initial_crypto(fixture("quic_initial_blocked.hex"))
+        self.assertIsNotNone(data)
+        self.assertIn(b"blocked.example", data)
+
+    def test_sni_mode_drops_only_matching_initial(self):
+        sim, _, _ = make(quic="sni")
+        self.assertFalse(sim.process(udp(fixture("quic_initial_blocked.hex"))))
+        self.assertTrue(sim.process(udp(fixture("quic_initial_allowed.hex"))))
+
+    def test_initial_mode_drops_every_initial_but_not_plain_udp(self):
+        sim, _, _ = make(quic="initial")
+        self.assertFalse(sim.process(udp(fixture("quic_initial_allowed.hex"))))
+        self.assertTrue(sim.process(udp(b"\x40" + b"x" * 40)))
+
+    def test_udp_mode_drops_everything_to_the_port_only(self):
+        sim, _, _ = make(quic="udp")
+        self.assertFalse(sim.process(udp(b"\x40" + b"x" * 40)))
+        self.assertTrue(sim.process(udp(b"\x40" + b"x" * 40, dport=8443)))
+
+    def test_icmp_action_answers_with_port_unreachable(self):
+        sim, sent, _ = make(quic="sni", quic_action="icmp")
+        self.assertFalse(sim.process(udp(fixture("quic_initial_blocked.hex"))))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual((sent[0][IP].src, sent[0][IP].dst), (S, C))
+        self.assertEqual((sent[0][ICMP].type, sent[0][ICMP].code), (3, 3))
+
+    def test_off_mode_leaves_udp_alone(self):
+        sim, _, _ = make(quic="off")
+        self.assertTrue(sim.process(udp(fixture("quic_initial_blocked.hex"))))
 
 
 if __name__ == "__main__":

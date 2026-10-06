@@ -5,7 +5,7 @@
 //! The profile describes what was observed; it is compatible with, but cannot
 //! prove, a particular kind of device.
 
-use crate::probe::{attempt, Attempt, Cut, Shape, Target};
+use crate::probe::{attempt, quic_attempt, quic_class, udp_attempt, Attempt, Cut, Shape, Target};
 use crate::ui::{self, colored, line, Row};
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -87,7 +87,7 @@ impl Cell {
         if t.iter().any(|a| a.seen().is_none()) {
             "ctl down"
         } else if t.iter().all(|a| a.seen() == Some(false)) {
-            "never saw"
+            if t[0].proto == "tcp" { "no full CH" } else { "not received" }
         } else if t.iter().all(|a| a.seen() == Some(true) && !a.partial()) {
             "saw it"
         } else if t.iter().any(|a| a.partial()) {
@@ -206,7 +206,38 @@ pub async fn cmd_fingerprint(t: Target, sni: String, controls: Vec<String>, repe
         cells.push(Cell { key: p.key, desc: p.desc, tests, ctl });
     }
 
+    // UDP / QUIC: a plain datagram, then QUIC Initials for the test and control SNIs.
+    if !t.json {
+        eprintln!("[udp/quic] plain UDP and QUIC Initial");
+    }
+    let mut raw = vec![];
+    for _ in 0..repeats {
+        raw.push(udp_attempt(&t).await);
+    }
+    let mut qtst = vec![];
+    for _ in 0..repeats {
+        qtst.push(quic_attempt(&t, &sni).await);
+    }
+    let mut qctl = vec![];
+    for c in &controls {
+        for _ in 0..repeats {
+            qctl.push(quic_attempt(&t, c).await);
+        }
+    }
+    let (quic_token, quic_lines) = quic_class(&raw, &qctl, &qtst);
+    let quic_text = quic_lines.first().map(|(l, _)| l.clone()).unwrap_or_default();
+    cells.push(Cell { key: "udp-echo", desc: "plain UDP datagram (not QUIC)", tests: raw, ctl: vec![] });
+    cells.push(Cell { key: "quic-initial", desc: "QUIC Initial with the test SNI", tests: qtst, ctl: qctl });
+
     let plain = cells.iter().find(|c| c.key == "plain").expect("plain cell");
+    let quic_label = match quic_token.as_str() {
+        "quic=unaffected" => "QUIC unaffected",
+        "quic=sni-drop" => "QUIC SNI-based drop",
+        "quic=sni-icmp" => "QUIC SNI-based ICMP unreachable",
+        "quic=sni-other" => "QUIC SNI-based interference",
+        "quic=blocked-all" => "QUIC blocked entirely",
+        _ => "UDP blocked",
+    };
     let (result, traits, verdict) = if !plain.valid() {
         (
             "control_failed".to_string(),
@@ -214,9 +245,18 @@ pub async fn cmd_fingerprint(t: Target, sni: String, controls: Vec<String>, repe
             "Control SNIs failed on the plain ClientHello: the path itself is unhealthy.".to_string(),
         )
     } else if !plain.blocked() {
-        ("not_blocked".to_string(), vec![], format!("{} is not interfered with: nothing to fingerprint.", sni))
+        if quic_token == "quic=unaffected" {
+            ("not_blocked".to_string(), vec![], format!("{} is not interfered with over TCP or QUIC: nothing to fingerprint.", sni))
+        } else {
+            (
+                format!("tcp=unaffected,{}", quic_token),
+                vec![Trait { token: quic_token.clone(), label: quic_label.to_string(), text: quic_text.clone() }],
+                format!("TCP is unaffected, but: {}", quic_label),
+            )
+        }
     } else {
-        let tr = derive(&cells);
+        let mut tr = derive(&cells);
+        tr.push(Trait { token: quic_token.clone(), label: quic_label.to_string(), text: quic_text.clone() });
         let result = tr.iter().map(|x| x.token.as_str()).collect::<Vec<_>>().join(",");
         let verdict = format!("Profile: {}", tr.iter().map(|x| x.label.as_str()).collect::<Vec<_>>().join(" / "));
         (result, tr, verdict)
@@ -265,8 +305,12 @@ pub async fn cmd_fingerprint(t: Target, sni: String, controls: Vec<String>, repe
         let mark = if c.mixed() { "~" } else { "" };
         rows.push(colored(
             format!(
-                "{:<16} {:<38} {:<12} {:<10} {}/{}",
-                c.key, c.desc, format!("{}{}", test, mark), c.server(), c.ctl_clean(), c.ctl.len()
+                "{:<16} {:<38} {:<12} {:<10} {}",
+                c.key,
+                c.desc,
+                format!("{}{}", test, mark),
+                c.server(),
+                if c.ctl.is_empty() { "-".to_string() } else { format!("{}/{}", c.ctl_clean(), c.ctl.len()) }
             ),
             color,
         ));

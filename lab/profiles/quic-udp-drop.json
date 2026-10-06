@@ -1,0 +1,1 @@
+{"desc": "QUIC only: drop all UDP to port 443", "tcp": false, "quic": "udp", "quic_action": "drop", "match": "", "server_port": 443}

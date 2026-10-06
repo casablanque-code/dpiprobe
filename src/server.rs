@@ -4,6 +4,7 @@
 //! alert, then keeps counting bytes so uploads can be accounted for.
 //! Control port: the probe asks "what did you see for token X?" (JSON line).
 
+use crate::quic;
 use crate::wire::*;
 use serde::Serialize;
 use serde_json::json;
@@ -15,7 +16,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     time::timeout,
 };
 
@@ -24,6 +25,8 @@ pub type State = Arc<Mutex<HashMap<String, Obs>>>;
 /// What the server observed for one connection.
 #[derive(Clone, Serialize)]
 pub struct Obs {
+    /// "tcp", "udp-quic" (QUIC Initial) or "udp" (plain datagram).
+    pub proto: &'static str,
     pub peer: String,
     /// SNI, or None when the ClientHello arrived only partially.
     pub sni: Option<String>,
@@ -59,7 +62,7 @@ async fn data_conn(mut s: TcpStream, peer: SocketAddr, st: State) {
     let rec = skip_pad(&buf);
     let Some(h) = parse_client_hello(rec) else { return };
     let pad = (buf.len() - rec.len()) / CCS.len();
-    let obs = Obs { peer: peer.to_string(), sni: h.sni.clone(), bytes: buf.len(), pad, rst };
+    let obs = Obs { proto: "tcp", peer: peer.to_string(), sni: h.sni.clone(), bytes: buf.len(), pad, rst };
     println!("{}", json!({"ev": "seen", "id": h.id, "obs": obs}));
     st.lock().unwrap().insert(h.id.clone(), obs);
     let _ = s.write_all(&ALERT).await;
@@ -78,6 +81,33 @@ async fn data_conn(mut s: TcpStream, peer: SocketAddr, st: State) {
                 }
                 break;
             }
+        }
+    }
+}
+
+/// UDP side: answers QUIC Initials with Version Negotiation and anything else
+/// with an echo marker, recording what arrived under the same kind of token.
+async fn udp_loop(sock: UdpSocket, st: State) {
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let (n, peer) = match sock.recv_from(&mut buf).await {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        let dg = &buf[..n];
+        if let Some(init) = quic::parse_initial(dg) {
+            if let Some(h) = quic::hello_of(&init) {
+                let obs = Obs { proto: "udp-quic", peer: peer.to_string(), sni: h.sni.clone(), bytes: n, pad: 0, rst: false };
+                println!("{}", json!({"ev": "seen", "id": h.id, "obs": obs}));
+                st.lock().unwrap().insert(h.id, obs);
+                let _ = sock.send_to(&quic::version_negotiation(&init.dcid, &init.scid), peer).await;
+            }
+        } else if n >= 33 {
+            let id = hex(&dg[1..33]);
+            let obs = Obs { proto: "udp", peer: peer.to_string(), sni: None, bytes: n, pad: 0, rst: false };
+            println!("{}", json!({"ev": "seen", "id": id, "obs": obs}));
+            st.lock().unwrap().insert(id, obs);
+            let _ = sock.send_to(quic::UDP_ECHO, peer).await;
         }
     }
 }
@@ -106,6 +136,12 @@ pub async fn run(data: String, ctl: String) {
             }
         }
     });
+    match UdpSocket::bind(&data).await {
+        Ok(sock) => {
+            tokio::spawn(udp_loop(sock, st.clone()));
+        }
+        Err(e) => eprintln!("warning: UDP {data} unavailable ({e}); QUIC/UDP measurements will not work"),
+    }
     eprintln!("listening data={data} ctl={ctl}");
     loop {
         if let Ok((s, p)) = d.accept().await {

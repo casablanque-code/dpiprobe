@@ -36,6 +36,7 @@ the forward path" or "the first segment was delivered and the flow was reset aft
 |---|---|
 | `dpiprobe probe` | Does this SNI trigger interference, and what does it look like (RST, drop, ...)? |
 | `dpiprobe fingerprint` | What does this middlebox look like? Runs 15 perturbations (split positions, tiny segments, padding packets, SNI position, big ClientHello, hostname case) and derives a profile: reaction, reassembly, case sensitivity, depth, payload window. Every cell is checked against several control SNIs. |
+| `dpiprobe quic` | Is QUIC (UDP 443) treated differently? Sends a plain UDP datagram, then QUIC Initials for control and test SNIs; separates "UDP blocked", "QUIC blocked entirely" and "SNI-based QUIC filtering". |
 | `dpiprobe depth` | How many client packets does the middlebox inspect? |
 | `dpiprobe threshold` | After how many uploaded bytes does it cut the flow? |
 | `dpiprobe server` | The ground-truth side. Run it outside the network under test. |
@@ -80,5 +81,5 @@ cargo build --release
 ln -sf "$PWD/bin/dpi" /usr/local/bin/dpi
 ```
 
-The lab needs Linux, root, `nft`, and a Python with `netfilterqueue` and `scapy`
+The lab needs Linux, root, `nft`, and a Python with `netfilterqueue`, `scapy` and (for QUIC profiles) `cryptography`
 (default `/root/lab/venv`, override with `DPI_PY`).

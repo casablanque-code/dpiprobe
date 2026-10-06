@@ -1,0 +1,1 @@
+{"desc": "TCP: SNI + RST (depth 3); QUIC: SNI-based drop", "match": "blocked.example", "action": "rst", "rst_to": "both", "max_pkts": 3, "stateful": false, "threshold_kb": 0, "quic": "sni", "quic_action": "drop", "server_port": 443}

@@ -2,6 +2,7 @@
 //! Every measurement is cross-checked against what the server really received.
 
 use crate::ui::{self, colored, line, Row};
+use crate::quic;
 use crate::wire::*;
 use clap::Args;
 use rand::RngCore;
@@ -13,7 +14,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::TcpStream,
+    net::{TcpStream, UdpSocket},
     time::{sleep, timeout},
 };
 
@@ -138,6 +139,8 @@ impl Shape {
 /// One connection attempt, as seen by the client and by the server.
 #[derive(Serialize)]
 pub struct Attempt {
+    /// "tcp", "quic" or "udp".
+    pub proto: &'static str,
     pub sni: String,
     /// tls_alert (normal), rst, timeout, eof, data, or *_err:<kind>
     pub outcome: String,
@@ -160,19 +163,21 @@ pub struct Attempt {
 }
 
 impl Attempt {
+    /// The normal, uninterfered reaction for this kind of attempt.
     pub fn ok(&self) -> bool {
-        self.outcome == "tls_alert"
+        matches!(self.outcome.as_str(), "tls_alert" | "quic_reply" | "udp_echo")
     }
     pub fn seen(&self) -> Option<bool> {
         if self.server.is_null() { None } else { Some(self.server["seen"] == true) }
     }
     pub fn partial(&self) -> bool {
-        self.seen() == Some(true) && self.server["obs"]["sni"].is_null()
+        self.proto == "tcp" && self.seen() == Some(true) && self.server["obs"]["sni"].is_null()
     }
     pub fn server_label(&self) -> &'static str {
         match self.seen() {
             None => "control channel down",
-            Some(false) => "never saw it",
+            Some(false) if self.proto == "tcp" => "no full CH",
+            Some(false) => "not received",
             Some(true) if self.partial() => "saw part of it",
             Some(true) => "saw it",
         }
@@ -270,11 +275,17 @@ pub async fn attempt(t: &Target, sni: &str, sh: &Shape) -> Attempt {
         },
     };
     let ms = t0.elapsed().as_millis() as u64;
+    finish(t, "tcp", sni, id, outcome, ms, cut, sh.pad).await
+}
+
+/// Ask the server what it saw, and assemble the evidence for one attempt.
+async fn finish(t: &Target, proto: &'static str, sni: &str, id: String, outcome: String, ms: u64, split: Option<usize>, pad: usize) -> Attempt {
     sleep(Duration::from_millis(300)).await;
     let server = ground(t, &id).await;
     let no_answer = matches!(outcome.as_str(), "timeout" | "connect_timeout");
     let server_seen = if server.is_null() { None } else { Some(server["seen"] == true) };
     Attempt {
+        proto,
         sni: sni.to_string(),
         client_rst: outcome == "rst",
         first_response_ms: if no_answer { None } else { Some(ms) },
@@ -283,11 +294,151 @@ pub async fn attempt(t: &Target, sni: &str, sh: &Shape) -> Attempt {
         server_seen,
         outcome,
         ms,
-        split: cut,
-        pad: sh.pad,
+        split,
+        pad,
         id,
         server,
     }
+}
+
+// ------------------------------------------------------------ UDP / QUIC
+
+/// Send one datagram and classify what comes back.
+async fn udp_exchange(t: &Target, dgram: &[u8], is_quic: bool) -> (String, u64) {
+    let t0 = Instant::now();
+    let sock = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => return (format!("bind_err:{:?}", e.kind()), 0),
+    };
+    if let Err(e) = sock.connect((t.server.as_str(), t.port)).await {
+        return (format!("connect_err:{:?}", e.kind()), 0);
+    }
+    if let Err(e) = sock.send(dgram).await {
+        return (format!("send_err:{:?}", e.kind()), 0);
+    }
+    let mut buf = [0u8; 2048];
+    let outcome = match timeout(Duration::from_secs(t.timeout), sock.recv(&mut buf)).await {
+        Err(_) => "timeout".to_string(),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => "icmp_unreachable".to_string(),
+        Ok(Err(e)) => format!("recv_err:{:?}", e.kind()),
+        Ok(Ok(n)) => {
+            let r = &buf[..n];
+            if is_quic && quic::is_version_negotiation(r) {
+                "quic_reply".to_string()
+            } else if !is_quic && r.starts_with(quic::UDP_ECHO) {
+                "udp_echo".to_string()
+            } else {
+                "data".to_string()
+            }
+        }
+    };
+    (outcome, t0.elapsed().as_millis() as u64)
+}
+
+/// One QUIC Initial carrying a ClientHello for `sni`.
+pub async fn quic_attempt(t: &Target, sni: &str) -> Attempt {
+    let random = new_token();
+    let mut cid = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut cid);
+    let dg = quic::build_initial(sni, &random, &cid, &[0xaa, 0xbb, 0xcc, 0xdd]);
+    let (outcome, ms) = udp_exchange(t, &dg, true).await;
+    finish(t, "quic", sni, hex(&random), outcome, ms, None, 0).await
+}
+
+/// One plain, non-QUIC datagram: does UDP to this port work at all?
+pub async fn udp_attempt(t: &Target) -> Attempt {
+    let random = new_token();
+    let mut dg = vec![0x40u8]; // short-header-looking first byte, not a QUIC long header
+    dg.extend_from_slice(&random);
+    dg.extend_from_slice(&[0u8; 31]);
+    let (outcome, ms) = udp_exchange(t, &dg, false).await;
+    finish(t, "udp", "(plain UDP)", hex(&random), outcome, ms, None, 0).await
+}
+
+/// Classify QUIC behaviour from three groups of attempts. The token is shared
+/// by `quic` and `fingerprint`: udp=blocked | quic=blocked-all | quic=unaffected
+/// | quic=sni-drop | quic=sni-icmp | quic=sni-other.
+pub fn quic_class(raw: &[Attempt], ctl: &[Attempt], tst: &[Attempt]) -> (String, Vec<(String, &'static str)>) {
+    let all_ok = |v: &[Attempt]| v.iter().all(|a| a.ok());
+    let outs: BTreeSet<&str> = tst.iter().map(|a| a.outcome.as_str()).collect();
+    let (token, lines): (String, Vec<(String, &'static str)>) = if !all_ok(raw) {
+        (
+            "udp=blocked".into(),
+            vec![("Plain UDP to the server port gets no answer: UDP is blocked or unreachable, so QUIC cannot be judged.".into(), ui::YELLOW)],
+        )
+    } else if !all_ok(ctl) {
+        (
+            "quic=blocked-all".into(),
+            vec![("UDP works but QUIC Initials with a control SNI fail too: QUIC is blocked regardless of the name (protocol-level).".into(), ui::RED)],
+        )
+    } else if all_ok(tst) {
+        ("quic=unaffected".into(), vec![("QUIC is unaffected: an Initial with the test SNI gets an answer.".into(), ui::GREEN)])
+    } else if outs.contains("timeout") && outs.len() == 1 {
+        (
+            "quic=sni-drop".into(),
+            vec![("SNI-dependent QUIC interference: Initials with the test SNI are silently dropped, controls pass.".into(), ui::RED)],
+        )
+    } else if outs.contains("icmp_unreachable") && outs.len() == 1 {
+        (
+            "quic=sni-icmp".into(),
+            vec![("SNI-dependent QUIC interference: Initials with the test SNI draw an ICMP unreachable, controls pass.".into(), ui::RED)],
+        )
+    } else {
+        (
+            "quic=sni-other".into(),
+            vec![(format!("SNI-dependent QUIC interference with an unusual reaction ({}).", outs.iter().cloned().collect::<Vec<_>>().join("/")), ui::RED)],
+        )
+    };
+    (token, lines)
+}
+
+pub async fn cmd_quic(t: Target, control_sni: String, test_sni: String, repeats: u32) {
+    let mut raw = vec![];
+    let mut ctl = vec![];
+    let mut tst = vec![];
+    for _ in 0..repeats {
+        raw.push(udp_attempt(&t).await);
+    }
+    for _ in 0..repeats {
+        ctl.push(quic_attempt(&t, &control_sni).await);
+    }
+    for _ in 0..repeats {
+        tst.push(quic_attempt(&t, &test_sni).await);
+    }
+    let (result, lines) = quic_class(&raw, &ctl, &tst);
+    let verdict = lines.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(" ");
+
+    if t.json {
+        for (kind, set) in [("udp-raw", &raw), ("control", &ctl), ("test", &tst)] {
+            for a in set {
+                let mut v = serde_json::to_value(a).unwrap();
+                v["kind"] = json!(kind);
+                print_json(&v);
+            }
+        }
+        print_json(&json!({"cmd": "quic", "result": result, "verdict": verdict}));
+        return;
+    }
+    let w = control_sni.len().max(test_sni.len()).max("(plain UDP)".len());
+    let mut rows = vec![
+        line(format!("target   {}:{}/udp   repeats {}   timeout {}s", t.server, t.port, repeats, t.timeout)),
+        Row::Sep,
+        line(format!("{:<8} {:<w$} {:<17} {:>7}   {}", "KIND", "SNI", "REACTION", "TIME", "SERVER", w = w)),
+    ];
+    for (kind, set) in [("udp-raw", &raw), ("control", &ctl), ("test", &tst)] {
+        for a in set {
+            rows.push(colored(
+                format!("{:<8} {:<w$} {:<17} {:>5}ms   {}", kind, a.sni, a.outcome, a.ms, a.server_label(), w = w),
+                outcome_color(a),
+            ));
+        }
+    }
+    rows.push(Row::Sep);
+    for (l, c) in lines {
+        rows.push(colored(l, c));
+    }
+    rows.push(colored("note: compatible with DPI-style QUIC filtering; it does not identify a product.", ui::DIM));
+    ui::boxed(&format!("quic: {} vs control {}", test_sni, control_sni), &rows);
 }
 
 fn outcome_color(a: &Attempt) -> &'static str {

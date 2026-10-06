@@ -1,0 +1,1 @@
+{"desc": "QUIC only: drop every QUIC Initial, whatever the SNI", "tcp": false, "quic": "initial", "quic_action": "drop", "match": "", "server_port": 443}
