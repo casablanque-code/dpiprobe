@@ -84,11 +84,21 @@ pub struct Attempt {
     pub sni: String,
     /// tls_alert (normal), rst, timeout, eof, data, or *_err:<kind>
     pub outcome: String,
+    /// Milliseconds from connect to the first reaction (or to giving up).
     pub ms: u64,
+    /// Milliseconds to the first response; None when nothing came back.
+    pub first_response_ms: Option<u64>,
+    pub client_rst: bool,
     pub split: Option<usize>,
     pub pad: usize,
     pub id: String,
-    /// Ground truth from the server (null if the control channel failed).
+    /// Did the server see this connection at all? None if the control channel failed.
+    pub server_seen: Option<bool>,
+    /// Bytes the server received on this connection.
+    pub server_bytes: Option<u64>,
+    /// Did the server's side of the connection end with a reset?
+    pub server_rst: Option<bool>,
+    /// Raw ground truth from the server (null if the control channel failed).
     pub server: Value,
 }
 
@@ -201,7 +211,22 @@ pub async fn attempt(t: &Target, sni: &str, sh: &Shape) -> Attempt {
     let ms = t0.elapsed().as_millis() as u64;
     sleep(Duration::from_millis(300)).await;
     let server = ground(t, &id).await;
-    Attempt { sni: sni.to_string(), outcome, ms, split: cut, pad: sh.pad, id, server }
+    let no_answer = matches!(outcome.as_str(), "timeout" | "connect_timeout");
+    let server_seen = if server.is_null() { None } else { Some(server["seen"] == true) };
+    Attempt {
+        sni: sni.to_string(),
+        client_rst: outcome == "rst",
+        first_response_ms: if no_answer { None } else { Some(ms) },
+        server_bytes: server["obs"]["bytes"].as_u64(),
+        server_rst: server_seen.filter(|s| *s).map(|_| server["obs"]["rst"] == true),
+        server_seen,
+        outcome,
+        ms,
+        split: cut,
+        pad: sh.pad,
+        id,
+        server,
+    }
 }
 
 fn outcome_color(a: &Attempt) -> &'static str {
@@ -214,23 +239,72 @@ fn print_json(v: &Value) {
 
 // ---------------------------------------------------------------- probe
 
-fn probe_verdict(result: &str, seen: usize, partial: usize) -> String {
+/// Aggregated evidence over the test attempts.
+struct Evidence {
+    attempts: usize,
+    interfered: usize,
+    saw_full: usize,
+    saw_partial: usize,
+    never_saw: usize,
+    client_rst: usize,
+    server_rst: usize,
+    median_ms: Option<u64>,
+}
+
+fn evidence(tst: &[Attempt]) -> Evidence {
+    let mut ms: Vec<u64> = tst.iter().filter_map(|a| a.first_response_ms).collect();
+    ms.sort_unstable();
+    Evidence {
+        attempts: tst.len(),
+        interfered: tst.iter().filter(|a| !a.ok()).count(),
+        saw_full: tst.iter().filter(|a| a.seen() == Some(true) && !a.partial()).count(),
+        saw_partial: tst.iter().filter(|a| a.partial()).count(),
+        never_saw: tst.iter().filter(|a| a.seen() == Some(false)).count(),
+        client_rst: tst.iter().filter(|a| a.client_rst).count(),
+        server_rst: tst.iter().filter(|a| a.server_rst == Some(true)).count(),
+        median_ms: if ms.is_empty() { None } else { Some(ms[ms.len() / 2]) },
+    }
+}
+
+/// Verdict lines as (text, colour). Wording is deliberately cautious: the
+/// observed behaviour is compatible with DPI, it does not prove DPI.
+fn probe_verdict(result: &str, e: &Evidence, control_clean: usize, control_n: usize) -> Vec<(String, &'static str)> {
     if result == "tls_alert" {
-        return "No interference: the ClientHello reached the server and was answered.".to_string();
+        return vec![(
+            format!("No interference observed: the ClientHello reached the server and was answered {}/{}.", e.attempts, e.attempts),
+            ui::GREEN,
+        )];
     }
     let how = match result {
-        "rst" => "RST injected",
+        "rst" => "RST",
         "timeout" => "silent drop",
         "eof" => "connection closed",
         _ => "mixed or unusual reaction",
     };
-    if seen == 0 {
-        format!("BLOCKED on the forward path ({how}): the server never saw the ClientHello.")
-    } else if partial > 0 {
-        format!("BLOCKED mid-handshake ({how}): the server got only part of the ClientHello,\nso the DPI reacted after the first segment was already delivered (likely stateful).")
+    let n = e.attempts;
+    let reaction = match e.median_ms {
+        Some(ms) => format!("median reaction {}ms", ms),
+        None => "no reaction (timeout)".to_string(),
+    };
+    let meaning = if e.never_saw == n {
+        format!("Forward path affected ({how}): the ClientHello never reached the server.")
+    } else if e.saw_partial > 0 {
+        "Cut mid-handshake: the first segment was delivered, so the middlebox tracks the stream across segments (likely stateful).".to_string()
     } else {
-        format!("Failed although the server got the full ClientHello ({how}):\nreply path blocked, or RST injected after delivery.")
-    }
+        format!("The server got the full ClientHello but the client still failed ({how}): reply path affected, or a reset after delivery.")
+    };
+    vec![
+        (format!("SNI-dependent interference: {}/{} attempts (control clean {}/{}).", e.interfered, n, control_clean, control_n), ui::RED),
+        (
+            format!(
+                "Evidence: server saw ClientHello {}/{} (partial {}), RST at client {}/{}, RST at server {}/{}, {}.",
+                e.saw_full, n, e.saw_partial, e.client_rst, n, e.server_rst, n, reaction
+            ),
+            ui::RED,
+        ),
+        (meaning, ui::RED),
+        ("note: compatible with DPI; one behaviour cannot prove that DPI is present.".to_string(), ui::DIM),
+    ]
 }
 
 pub async fn cmd_probe(t: Target, control_sni: String, test_sni: String, repeats: u32, sh: Shape) {
@@ -242,20 +316,21 @@ pub async fn cmd_probe(t: Target, control_sni: String, test_sni: String, repeats
     for _ in 0..repeats {
         tst.push(attempt(&t, &test_sni, &sh).await);
     }
-    let control_ok = ctl.iter().all(|a| a.ok());
+    let control_clean = ctl.iter().filter(|a| a.ok()).count();
+    let control_ok = control_clean == ctl.len();
+    let ev = evidence(&tst);
     let outcomes: BTreeSet<&str> = tst.iter().map(|a| a.outcome.as_str()).collect();
-    let seen = tst.iter().filter(|a| a.seen() == Some(true)).count();
-    let partial = tst.iter().filter(|a| a.partial()).count();
-    let (result, verdict) = if !control_ok {
+    let (result, lines) = if !control_ok {
         (
             "control_failed".to_string(),
-            "Control SNI failed: the path itself is unhealthy, do not trust the test rows.".to_string(),
+            vec![("Control SNI failed: the path itself is unhealthy, do not trust the test rows.".to_string(), ui::YELLOW)],
         )
     } else {
         let r = outcomes.iter().cloned().collect::<Vec<_>>().join(",");
-        let v = probe_verdict(&r, seen, partial);
-        (r, v)
+        let l = probe_verdict(&r, &ev, control_clean, ctl.len());
+        (r, l)
     };
+    let verdict = lines.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(" ");
 
     if t.json {
         for (kind, set) in [("control", &ctl), ("test", &tst)] {
@@ -265,7 +340,16 @@ pub async fn cmd_probe(t: Target, control_sni: String, test_sni: String, repeats
                 print_json(&v);
             }
         }
-        print_json(&json!({"cmd": "probe", "result": result, "verdict": verdict}));
+        print_json(&json!({
+            "cmd": "probe", "result": result, "verdict": verdict,
+            "features": {
+                "attempts": ev.attempts, "interfered": ev.interfered,
+                "server_saw_full": ev.saw_full, "server_saw_partial": ev.saw_partial, "server_never_saw": ev.never_saw,
+                "client_rst": ev.client_rst, "server_rst": ev.server_rst,
+                "median_response_ms": ev.median_ms, "timeout_ms": t.timeout * 1000,
+                "control_clean": control_clean, "control_attempts": ctl.len(),
+            }
+        }));
         return;
     }
 
@@ -285,9 +369,8 @@ pub async fn cmd_probe(t: Target, control_sni: String, test_sni: String, repeats
         }
     }
     rows.push(Row::Sep);
-    let color = if result == "tls_alert" { ui::GREEN } else if result == "control_failed" { ui::YELLOW } else { ui::RED };
-    for l in verdict.lines() {
-        rows.push(colored(l, color));
+    for (l, c) in lines {
+        rows.push(colored(l, c));
     }
     ui::boxed(&format!("probe: {} vs control {}", test_sni, control_sni), &rows);
 }
@@ -324,7 +407,7 @@ pub async fn cmd_depth(t: Target, sni: String, control_sni: String, max_pad: usi
         r => {
             let n: usize = r[6..].parse().unwrap_or(0);
             format!(
-                "The DPI inspects only the first {n} client packets.\nA ClientHello in packet {} or later is not examined.",
+                "The middlebox inspects only the first {n} client packets.\nA ClientHello in packet {} or later is not examined.",
                 n + 1
             )
         }
@@ -360,8 +443,8 @@ pub async fn cmd_depth(t: Target, sni: String, control_sni: String, max_pad: usi
     for l in verdict.lines() {
         rows.push(colored(l, color));
     }
-    rows.push(colored("note: padding packets are 6 bytes; a byte-limited DPI looks the same (see `threshold`).", ui::DIM));
-    ui::boxed(&format!("depth: how many packets does the DPI inspect? ({})", sni), &rows);
+    rows.push(colored("note: padding packets are 6 bytes; a byte-limited middlebox looks the same (see `threshold`).", ui::DIM));
+    ui::boxed(&format!("depth: how many packets does the middlebox inspect? ({})", sni), &rows);
 }
 
 // ------------------------------------------------------------ threshold
@@ -431,7 +514,7 @@ fn report_threshold(
     let (result, verdict) = if hello_outcome != "tls_alert" || g.is_null() || g["seen"] != true {
         (
             "control_failed".to_string(),
-            format!("The ClientHello for {sni} was disturbed before the upload ({hello_outcome}).\nPick an SNI the DPI does not match (it may be blocked)."),
+            format!("The ClientHello for {sni} was disturbed before the upload ({hello_outcome}).\nPick an SNI the middlebox does not match (it may be blocked)."),
         )
     } else if server_rx >= expected {
         (

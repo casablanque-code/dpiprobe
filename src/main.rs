@@ -50,11 +50,11 @@ enum Cmd {
         #[command(flatten)]
         shape: Shape,
     },
-    /// Measure inspection depth: how many client packets the DPI looks at
+    /// Measure inspection depth: how many client packets the middlebox looks at
     Depth {
         #[command(flatten)]
         t: Target,
-        /// SNI that triggers the DPI
+        /// SNI that triggers the middlebox
         #[arg(long)]
         sni: String,
         /// SNI that should pass untouched
@@ -64,11 +64,11 @@ enum Cmd {
         #[arg(long, default_value_t = 16)]
         max_pad: usize,
     },
-    /// Measure the upload cutoff: after how many bytes the DPI kills or freezes the flow
+    /// Measure the upload cutoff: after how many bytes the middlebox kills or freezes the flow
     Threshold {
         #[command(flatten)]
         t: Target,
-        /// SNI to use (must NOT trigger the DPI by name)
+        /// SNI to use (must NOT trigger the middlebox by name)
         #[arg(long, default_value = "allowed.example")]
         sni: String,
         /// Upload up to this many KB

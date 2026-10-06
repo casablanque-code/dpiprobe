@@ -1,3 +1,4 @@
 /target
 /venv
 *.log
+__pycache__/

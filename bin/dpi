@@ -103,17 +103,17 @@ rule_off() { nsx dpi nft flush chain inet f fw 2>/dev/null; }
 dpi_stop() {
   rule_off
   alive "$RUN/dpi.pid" && kill "$(cat "$RUN/dpi.pid")" 2>/dev/null
-  pkill -f 'lab/dpi.py' 2>/dev/null
+  pkill -f 'lab/dpi(_sim)?\.py' 2>/dev/null
   rm -f "$RUN/dpi.pid"; sleep 0.2
   return 0
 }
 
 dpi_start() {
-  [[ -f $REPO/lab/dpi.py ]] || die "missing $REPO/lab/dpi.py"
+  [[ -f $REPO/lab/dpi_sim.py ]] || die "missing $REPO/lab/dpi_sim.py"
   [[ -x $PY ]] || die "no python for the DPI process: $PY (set DPI_PY=...)"
   dpi_stop
   : > "$RUN/dpi.log"
-  ip netns exec dpi nohup "$PY" "$REPO/lab/dpi.py" "$RUN/dpi.json" >> "$RUN/dpi.log" 2>&1 < /dev/null &
+  ip netns exec dpi nohup "$PY" "$REPO/lab/dpi_sim.py" "$RUN/dpi.json" >> "$RUN/dpi.log" 2>&1 < /dev/null &
   echo $! > "$RUN/dpi.pid"
   wait_for "$RUN/dpi.log" '"ev": "start"' || die "DPI failed to start, see: dpi log"
   rule_on
@@ -216,6 +216,8 @@ cmd_test() {
   [[ $fail -eq 0 ]]
 }
 
+cmd_selftest() { "$PY" "$REPO/lab/test_dpi_sim.py"; }
+
 cmd_profiles() { python3 -c "$PYPROF" "$REPO/lab/profiles"; }
 
 cmd_down() { dpi_stop; server_off; local n; for n in cl dpi sv; do ip netns del $n 2>/dev/null; done; echo "lab removed."; }
@@ -229,7 +231,7 @@ cmd_doctor() {
   chk "python3 installed"                  'command -v python3'
   chk "DPI python has netfilterqueue+scapy ($PY)" '"$PY" -c "import netfilterqueue, scapy"'
   chk "dpiprobe built ($BIN)"              '[[ -x $BIN ]]'
-  chk "lab/dpi.py present"                 '[[ -f $REPO/lab/dpi.py ]]'
+  chk "lab/dpi_sim.py present"             '[[ -f $REPO/lab/dpi_sim.py ]]'
   chk "network namespaces usable"          'ip netns list'
   box "dpi doctor" "${rows[@]}"
   return $bad
@@ -248,6 +250,7 @@ LAB CONTROL
   dpi profiles                list profiles (lab/profiles/*.json)
   dpi log [srv] [-f]          DPI log, or server log with `srv`; -f follows
   dpi doctor                  check prerequisites
+  dpi selftest                unit tests of the simulated middlebox (lab/dpi_sim.py)
   dpi down                    stop everything and delete the lab
 
 MEASUREMENTS (run from the client side of the lab)
@@ -285,6 +288,7 @@ case $c in
   profiles) cmd_profiles ;;
   log) cmd_log "$@" ;;
   doctor) cmd_doctor ;;
+  selftest) cmd_selftest ;;
   down) cmd_down ;;
   *) echo "unknown command: $c" >&2; cmd_help; exit 1 ;;
 esac
