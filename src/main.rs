@@ -4,6 +4,7 @@
 //! `depth`, `threshold`) from behind the network under test. The server tells
 //! the probe what really arrived, so every verdict is checked against reality.
 
+mod fingerprint;
 mod probe;
 mod server;
 mod ui;
@@ -16,7 +17,7 @@ use probe::{Shape, Target};
 #[command(
     name = "dpiprobe",
     about = "Controlled DPI probe with ground truth: a client plus a server that records what really arrived.",
-    after_help = "EXAMPLES:\n  dpiprobe server\n  dpiprobe probe --server 203.0.113.5 --test-sni blocked.example\n  dpiprobe probe --server 203.0.113.5 --test-sni blocked.example --split-sni\n  dpiprobe depth --server 203.0.113.5 --sni blocked.example\n  dpiprobe threshold --server 203.0.113.5"
+    after_help = "EXAMPLES:\n  dpiprobe server\n  dpiprobe probe --server 203.0.113.5 --test-sni blocked.example\n  dpiprobe probe --server 203.0.113.5 --test-sni blocked.example --split-sni\n  dpiprobe depth --server 203.0.113.5 --sni blocked.example\n  dpiprobe fingerprint --server 203.0.113.5 --sni blocked.example\n  dpiprobe threshold --server 203.0.113.5"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -64,6 +65,20 @@ enum Cmd {
         #[arg(long, default_value_t = 16)]
         max_pad: usize,
     },
+    /// Run a matrix of ClientHello perturbations and derive a behaviour profile of the middlebox
+    Fingerprint {
+        #[command(flatten)]
+        t: Target,
+        /// SNI that triggers the middlebox
+        #[arg(long)]
+        sni: String,
+        /// SNIs that should pass untouched (comma separated); every cell is checked against all of them
+        #[arg(long, value_delimiter = ',', default_values_t = vec!["allowed.example".to_string(), "control.example".to_string()])]
+        control_sni: Vec<String>,
+        /// Attempts per cell
+        #[arg(long, default_value_t = 1)]
+        repeats: u32,
+    },
     /// Measure the upload cutoff: after how many bytes the middlebox kills or freezes the flow
     Threshold {
         #[command(flatten)]
@@ -88,6 +103,9 @@ async fn main() {
             probe::cmd_probe(t, control_sni, test_sni, repeats, shape).await
         }
         Cmd::Depth { t, sni, control_sni, max_pad } => probe::cmd_depth(t, sni, control_sni, max_pad).await,
+        Cmd::Fingerprint { t, sni, control_sni, repeats } => {
+            fingerprint::cmd_fingerprint(t, sni, control_sni, repeats).await
+        }
         Cmd::Threshold { t, sni, max_kb, chunk } => probe::cmd_threshold(t, sni, max_kb, chunk).await,
     }
 }

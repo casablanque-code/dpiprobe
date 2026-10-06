@@ -256,6 +256,8 @@ LAB CONTROL
 MEASUREMENTS (run from the client side of the lab)
   dpi probe [opts]            classify the reaction to a blocked SNI (rst / drop / ...)
                               e.g. dpi probe --split-sni      (default --test-sni blocked.example)
+  dpi fingerprint [opts]      run a matrix of ClientHello perturbations and derive a middlebox profile
+                              (reaction, reassembly, case, depth, window); slow: ~15 cells
   dpi depth [opts]            how many client packets does the DPI inspect?
   dpi threshold [opts]        after how many uploaded bytes does the DPI cut the flow?
   Every option of `dpiprobe <command> --help` works here.
@@ -263,7 +265,8 @@ MEASUREMENTS (run from the client side of the lab)
 TESTS
   dpi test [filter]           run lab/tests.tsv: each row is  profile | dpiprobe args | expected result
                               expected: probe -> tls_alert|rst|timeout, depth -> depth=N,
-                              threshold -> cutoff=NKB|cutoff=none
+                              threshold -> cutoff=NKB|cutoff=none,
+                              fingerprint -> comma-separated traits, e.g. rst,stateless,case-sensitive,depth=3,deep-scan
   RAW output for scripts: add --json to any measurement.
 
 TYPICAL SESSION
@@ -283,6 +286,7 @@ case $c in
   status|st) cmd_status ;;
   probe|p) run_tool probe --test-sni blocked.example "$@" ;;
   depth|d) run_tool depth --sni blocked.example "$@" ;;
+  fingerprint|fp) run_tool fingerprint --sni blocked.example "$@" ;;
   threshold|th) run_tool threshold "" "" "$@" ;;
   test|t) cmd_test "$@" ;;
   profiles) cmd_profiles ;;

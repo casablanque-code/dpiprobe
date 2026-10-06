@@ -37,6 +37,19 @@ pub struct Target {
     pub json: bool,
 }
 
+/// Where to cut the ClientHello into two segments (used by `fingerprint`).
+#[derive(Clone, Copy)]
+pub enum Cut {
+    /// After this many bytes of the ClientHello.
+    At(usize),
+    /// Right before the hostname.
+    SniStart,
+    /// In the middle of the hostname.
+    SniMid,
+    /// One byte before the end of the hostname.
+    SniEnd,
+}
+
 /// How the ClientHello is put on the wire.
 #[derive(Args, Clone)]
 pub struct Shape {
@@ -46,20 +59,41 @@ pub struct Shape {
     /// Split the ClientHello in the middle of the SNI hostname
     #[arg(long)]
     pub split_sni: bool,
-    /// Pause between the two segments, in ms
+    /// Pause between segments, in ms
     #[arg(long, default_value_t = 50)]
     pub split_delay: u64,
+    /// Send the ClientHello in segments of N bytes (0 = off)
+    #[arg(long, default_value_t = 0)]
+    pub segment: usize,
     /// Send N padding packets before the ClientHello
     #[arg(long, default_value_t = 0)]
     pub pad: usize,
     /// Pause after each padding packet, in ms
     #[arg(long, default_value_t = 20)]
     pub pad_delay: u64,
+    /// Put the SNI extension last in the ClientHello
+    #[arg(long)]
+    pub sni_last: bool,
+    /// Add a padding extension of N bytes before the SNI (pushes the hostname deeper)
+    #[arg(long, default_value_t = 0)]
+    pub hello_pad: usize,
+    #[arg(skip)]
+    pub cut: Option<Cut>,
 }
 
 impl Default for Shape {
     fn default() -> Self {
-        Shape { split: 0, split_sni: false, split_delay: 50, pad: 0, pad_delay: 20 }
+        Shape {
+            split: 0,
+            split_sni: false,
+            split_delay: 50,
+            segment: 0,
+            pad: 0,
+            pad_delay: 20,
+            sni_last: false,
+            hello_pad: 0,
+            cut: None,
+        }
     }
 }
 
@@ -71,10 +105,33 @@ impl Shape {
         } else if self.split > 0 {
             v.push(format!("split at byte {}", self.split));
         }
+        if self.segment > 0 {
+            v.push(format!("{}-byte segments", self.segment));
+        }
         if self.pad > 0 {
             v.push(format!("{} padding packets", self.pad));
         }
+        if self.sni_last {
+            v.push("SNI extension last".to_string());
+        }
+        if self.hello_pad > 0 {
+            v.push(format!("{}-byte padding extension", self.hello_pad));
+        }
         if v.is_empty() { "plain".to_string() } else { v.join(", ") }
+    }
+
+    /// Where the ClientHello is cut into two segments, if anywhere.
+    fn cut_point(&self, ch: &[u8], sni: &str) -> Option<usize> {
+        let name_at = sni_offset(ch, sni);
+        match self.cut {
+            Some(Cut::At(n)) => Some(n.min(ch.len() - 1)),
+            Some(Cut::SniStart) => name_at,
+            Some(Cut::SniMid) => name_at.map(|p| p + sni.len() / 2),
+            Some(Cut::SniEnd) => name_at.map(|p| p + sni.len().saturating_sub(1)),
+            None if self.split_sni => name_at.map(|p| p + sni.len() / 2),
+            None if self.split > 0 => Some(self.split.min(ch.len() - 1)),
+            None => None,
+        }
     }
 }
 
@@ -106,13 +163,13 @@ impl Attempt {
     pub fn ok(&self) -> bool {
         self.outcome == "tls_alert"
     }
-    fn seen(&self) -> Option<bool> {
+    pub fn seen(&self) -> Option<bool> {
         if self.server.is_null() { None } else { Some(self.server["seen"] == true) }
     }
-    fn partial(&self) -> bool {
+    pub fn partial(&self) -> bool {
         self.seen() == Some(true) && self.server["obs"]["sni"].is_null()
     }
-    fn server_label(&self) -> &'static str {
+    pub fn server_label(&self) -> &'static str {
         match self.seen() {
             None => "control channel down",
             Some(false) => "never saw it",
@@ -162,6 +219,16 @@ async fn send_hello(s: &mut TcpStream, ch: &[u8], cut: Option<usize>, sh: &Shape
         s.flush().await?;
         sleep(Duration::from_millis(sh.pad_delay)).await;
     }
+    if sh.segment > 0 {
+        for (i, piece) in ch.chunks(sh.segment).enumerate() {
+            if i > 0 {
+                sleep(Duration::from_millis(sh.split_delay)).await;
+            }
+            s.write_all(piece).await?;
+            s.flush().await?;
+        }
+        return Ok(());
+    }
     match cut {
         Some(c) => {
             s.write_all(&ch[..c]).await?;
@@ -192,14 +259,8 @@ fn new_token() -> [u8; 32] {
 pub async fn attempt(t: &Target, sni: &str, sh: &Shape) -> Attempt {
     let random = new_token();
     let id = hex(&random);
-    let ch = build_client_hello(sni, &random);
-    let cut = if sh.split_sni {
-        sni_split_point(&ch, sni)
-    } else if sh.split > 0 {
-        Some(sh.split.min(ch.len() - 1))
-    } else {
-        None
-    };
+    let ch = build_client_hello(sni, &random, sh.sni_last, sh.hello_pad);
+    let cut = sh.cut_point(&ch, sni);
     let t0 = Instant::now();
     let outcome = match connect(t).await {
         Err(o) => o,
@@ -452,7 +513,7 @@ pub async fn cmd_depth(t: Target, sni: String, control_sni: String, max_pad: usi
 pub async fn cmd_threshold(t: Target, sni: String, max_kb: usize, chunk: usize) {
     let random = new_token();
     let id = hex(&random);
-    let ch = build_client_hello(&sni, &random);
+    let ch = build_client_hello(&sni, &random, false, 0);
     let chunk = chunk.max(1);
     let total = max_kb * 1024;
 

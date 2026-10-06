@@ -13,19 +13,36 @@ pub fn hex(b: &[u8]) -> String {
 
 /// Build a minimal TLS 1.3-flavoured ClientHello. The 32-byte `random` field
 /// doubles as a correlation token between probe and server.
-pub fn build_client_hello(sni: &str, random: &[u8; 32]) -> Vec<u8> {
+///
+/// `sni_last` moves the server_name extension to the end of the extension list;
+/// `pad_ext` prepends a padding extension of that many zero bytes, which pushes
+/// the hostname deeper into the packet.
+pub fn build_client_hello(sni: &str, random: &[u8; 32], sni_last: bool, pad_ext: usize) -> Vec<u8> {
     let name = sni.as_bytes();
     let mut sn = Vec::new();
     sn.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
     sn.push(0);
     sn.extend_from_slice(&(name.len() as u16).to_be_bytes());
     sn.extend_from_slice(name);
-    let mut ext = vec![0, 0];
-    ext.extend_from_slice(&(sn.len() as u16).to_be_bytes());
-    ext.extend_from_slice(&sn);
+    let mut sni_ext = vec![0, 0];
+    sni_ext.extend_from_slice(&(sn.len() as u16).to_be_bytes());
+    sni_ext.extend_from_slice(&sn);
+
+    let mut ext = Vec::new();
+    if pad_ext > 0 {
+        ext.extend_from_slice(&[0, 0x15]);
+        ext.extend_from_slice(&(pad_ext as u16).to_be_bytes());
+        ext.extend(std::iter::repeat(0u8).take(pad_ext));
+    }
+    if !sni_last {
+        ext.extend_from_slice(&sni_ext);
+    }
     ext.extend_from_slice(&[0, 0x0a, 0, 4, 0, 2, 0, 0x1d]); // supported_groups: x25519
     ext.extend_from_slice(&[0, 0x0d, 0, 4, 0, 2, 8, 4]); // signature_algorithms
     ext.extend_from_slice(&[0, 0x2b, 0, 3, 2, 3, 4]); // supported_versions: TLS 1.3
+    if sni_last {
+        ext.extend_from_slice(&sni_ext);
+    }
     let mut body = vec![3, 3];
     body.extend_from_slice(random);
     body.push(0); // empty session id
@@ -42,14 +59,13 @@ pub fn build_client_hello(sni: &str, random: &[u8; 32]) -> Vec<u8> {
     rec
 }
 
-/// Offset in the middle of the SNI hostname, for splitting the ClientHello
-/// so that no single segment contains the whole name.
-pub fn sni_split_point(ch: &[u8], sni: &str) -> Option<usize> {
+/// Offset of the SNI hostname inside the ClientHello bytes.
+pub fn sni_offset(ch: &[u8], sni: &str) -> Option<usize> {
     let name = sni.as_bytes();
     if name.is_empty() {
         return None;
     }
-    ch.windows(name.len()).position(|w| w == name).map(|p| p + name.len() / 2)
+    ch.windows(name.len()).position(|w| w == name)
 }
 
 /// Strip leading padding records (see `CCS`).
