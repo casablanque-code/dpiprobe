@@ -51,6 +51,17 @@ pub enum Cut {
     SniEnd,
 }
 
+impl Target {
+    /// "host:port" with IPv6 literals in brackets.
+    pub fn addr(&self) -> String {
+        if self.server.contains(':') {
+            format!("[{}]:{}", self.server, self.port)
+        } else {
+            format!("{}:{}", self.server, self.port)
+        }
+    }
+}
+
 /// How the ClientHello is put on the wire.
 #[derive(Args, Clone)]
 pub struct Shape {
@@ -184,11 +195,22 @@ impl Attempt {
     }
 }
 
+/// A short, readable name for an I/O error; raw errno when Rust has no name for it
+/// (for example "os97" = address family not supported, i.e. IPv6 is unavailable).
+fn kind_name(e: &std::io::Error) -> String {
+    let k = format!("{:?}", e.kind());
+    if k == "Uncategorized" || k == "Other" {
+        e.raw_os_error().map(|n| format!("os{n}")).unwrap_or(k)
+    } else {
+        k
+    }
+}
+
 fn io_outcome(stage: &str, e: std::io::Error) -> String {
     use std::io::ErrorKind::*;
     match e.kind() {
         ConnectionReset | BrokenPipe | ConnectionAborted => "rst".to_string(),
-        k => format!("{stage}_err:{k:?}"),
+        _ => format!("{stage}_err:{}", kind_name(&e)),
     }
 }
 
@@ -210,7 +232,7 @@ async fn ground(t: &Target, id: &str) -> Value {
 async fn connect(t: &Target) -> Result<TcpStream, String> {
     match timeout(Duration::from_secs(5), TcpStream::connect((t.server.as_str(), t.port))).await {
         Err(_) => Err("connect_timeout".to_string()),
-        Ok(Err(e)) => Err(format!("connect_err:{:?}", e.kind())),
+        Ok(Err(e)) => Err(format!("connect_err:{}", kind_name(&e))),
         Ok(Ok(s)) => {
             let _ = s.set_nodelay(true);
             Ok(s)
@@ -306,21 +328,27 @@ async fn finish(t: &Target, proto: &'static str, sni: &str, id: String, outcome:
 /// Send one datagram and classify what comes back.
 async fn udp_exchange(t: &Target, dgram: &[u8], is_quic: bool) -> (String, u64) {
     let t0 = Instant::now();
-    let sock = match UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => s,
-        Err(e) => return (format!("bind_err:{:?}", e.kind()), 0),
+    let target = match tokio::net::lookup_host((t.server.as_str(), t.port)).await {
+        Ok(mut it) => it.next(),
+        Err(_) => None,
     };
-    if let Err(e) = sock.connect((t.server.as_str(), t.port)).await {
-        return (format!("connect_err:{:?}", e.kind()), 0);
+    let Some(target) = target else { return ("resolve_err".to_string(), 0) };
+    let local = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let sock = match UdpSocket::bind(local).await {
+        Ok(s) => s,
+        Err(e) => return (format!("bind_err:{}", kind_name(&e)), 0),
+    };
+    if let Err(e) = sock.connect(target).await {
+        return (format!("connect_err:{}", kind_name(&e)), 0);
     }
     if let Err(e) = sock.send(dgram).await {
-        return (format!("send_err:{:?}", e.kind()), 0);
+        return (format!("send_err:{}", kind_name(&e)), 0);
     }
     let mut buf = [0u8; 2048];
     let outcome = match timeout(Duration::from_secs(t.timeout), sock.recv(&mut buf)).await {
         Err(_) => "timeout".to_string(),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => "icmp_unreachable".to_string(),
-        Ok(Err(e)) => format!("recv_err:{:?}", e.kind()),
+        Ok(Err(e)) => format!("recv_err:{}", kind_name(&e)),
         Ok(Ok(n)) => {
             let r = &buf[..n];
             if is_quic && quic::is_version_negotiation(r) {
@@ -421,7 +449,7 @@ pub async fn cmd_quic(t: Target, control_sni: String, test_sni: String, repeats:
     }
     let w = control_sni.len().max(test_sni.len()).max("(plain UDP)".len());
     let mut rows = vec![
-        line(format!("target   {}:{}/udp   repeats {}   timeout {}s", t.server, t.port, repeats, t.timeout)),
+        line(format!("target   {}/udp   repeats {}   timeout {}s", t.addr(), repeats, t.timeout)),
         Row::Sep,
         line(format!("{:<8} {:<w$} {:<17} {:>7}   {}", "KIND", "SNI", "REACTION", "TIME", "SERVER", w = w)),
     ];
@@ -567,7 +595,7 @@ pub async fn cmd_probe(t: Target, control_sni: String, test_sni: String, repeats
 
     let w = control_sni.len().max(test_sni.len());
     let mut rows = vec![
-        line(format!("target   {}:{}   repeats {}   timeout {}s", t.server, t.port, repeats, t.timeout)),
+        line(format!("target   {}   repeats {}   timeout {}s", t.addr(), repeats, t.timeout)),
         line(format!("shape    {}", sh.describe())),
         Row::Sep,
         line(format!("{:<8} {:<w$} {:<12} {:>7}   {}", "KIND", "SNI", "REACTION", "TIME", "SERVER", w = w)),
@@ -639,7 +667,7 @@ pub async fn cmd_depth(t: Target, sni: String, control_sni: String, max_pad: usi
     }
 
     let mut rows = vec![
-        line(format!("target   {}:{}   max padding {}   timeout {}s", t.server, t.port, max_pad, t.timeout)),
+        line(format!("target   {}   max padding {}   timeout {}s", t.addr(), max_pad, t.timeout)),
         line(format!("control  {}  ->  {}", control_sni, c.outcome)),
         Row::Sep,
         line(format!("{:<9} {:<14} {:<12} {:>7}   {}", "PADDING", "CH IS PACKET", "REACTION", "TIME", "SERVER")),
@@ -755,7 +783,7 @@ fn report_threshold(
     }
     let color = if result == "cutoff=none" { ui::GREEN } else if result == "control_failed" { ui::YELLOW } else { ui::RED };
     let rows = vec![
-        line(format!("target    {}:{}   chunk {} B   max {} KB", t.server, t.port, chunk, max_kb)),
+        line(format!("target    {}   chunk {} B   max {} KB", t.addr(), chunk, max_kb)),
         Row::Sep,
         line(format!("{:<18} {:>8} bytes  (ClientHello {} + upload {})", "client sent", expected, hello, sent)),
         line(format!("{:<18} {:>8} bytes", "server received", server_rx)),

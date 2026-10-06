@@ -18,6 +18,7 @@ Config keys:
   server_port   TCP port of the protected service
   flow_ttl      seconds of inactivity before per-flow counters are forgotten
   blocked_ttl   seconds a triggered flow stays marked as blocked
+  v6            false: leave IPv6 traffic alone (an IPv4-only middlebox), default true
   tcp           false: leave TCP alone (useful for QUIC-only profiles), default true
   quic          UDP/QUIC model for datagrams to server_port:
                   "off"      leave UDP alone (default)
@@ -47,6 +48,7 @@ DEFAULTS = {
     "flow_ttl": 60,
     "blocked_ttl": 120,
     "gc_interval": 5,
+    "v6": True,
     "tcp": True,
     "quic": "off",
     "quic_action": "drop",
@@ -160,8 +162,11 @@ class Sim:
     # -- packet handling ----------------------------------------------------
     def process(self, raw):
         """Return True to accept the packet, False to drop it."""
-        from scapy.all import IP, TCP, UDP, Raw
-        ip = IP(raw)
+        from scapy.all import IP, IPv6, TCP, UDP, Raw
+        v6 = (raw[0] >> 4) == 6
+        if v6 and not self.cfg["v6"]:
+            return True
+        ip = IPv6(raw) if v6 else IP(raw)
         if UDP in ip:
             return self.process_udp(ip, raw)
         if TCP not in ip or not self.cfg["tcp"]:
@@ -219,9 +224,9 @@ class Sim:
         log(ev=why, flow=str(key), pkt=f["n"], bytes=f["bytes"], action=cfg["action"])
         if cfg["action"] == "rst":
             if cfg["rst_to"] in ("client", "both"):
-                self.rst(ip.dst, ip.src, t.dport, t.sport, t.ack)
+                self.rst(ip.dst, ip.src, t.dport, t.sport, t.ack, v6)
             if cfg["rst_to"] in ("server", "both"):
-                self.rst(ip.src, ip.dst, t.sport, t.dport, t.seq)
+                self.rst(ip.src, ip.dst, t.sport, t.dport, t.seq, v6)
         return False
 
     def process_udp(self, ip, raw):
@@ -251,13 +256,18 @@ class Sim:
         return False
 
     def icmp_unreachable(self, ip, raw):
-        from scapy.all import IP, ICMP
-        inner = raw[:ip.ihl * 4 + 8]
-        self.sender(IP(src=ip.dst, dst=ip.src) / ICMP(type=3, code=3) / inner, verbose=0)
+        from scapy.all import ICMP, ICMPv6DestUnreach, IP, IPv6
+        if isinstance(ip, IPv6):
+            # ICMPv6 destination unreachable, code 4 = port unreachable
+            pkt = IPv6(src=ip.dst, dst=ip.src) / ICMPv6DestUnreach(code=4) / raw[:1232]
+        else:
+            pkt = IP(src=ip.dst, dst=ip.src) / ICMP(type=3, code=3) / raw[:ip.ihl * 4 + 8]
+        self.sender(pkt, verbose=0)
 
-    def rst(self, src, dst, sport, dport, seq):
-        from scapy.all import IP, TCP
-        self.sender(IP(src=src, dst=dst) / TCP(sport=sport, dport=dport, flags="R", seq=seq), verbose=0)
+    def rst(self, src, dst, sport, dport, seq, v6=False):
+        from scapy.all import IP, IPv6, TCP
+        layer = IPv6 if v6 else IP
+        self.sender(layer(src=src, dst=dst) / TCP(sport=sport, dport=dport, flags="R", seq=seq), verbose=0)
 
 
 def main():

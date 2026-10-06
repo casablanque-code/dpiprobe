@@ -185,22 +185,23 @@ fn derive(cells: &[Cell]) -> Vec<Trait> {
     v
 }
 
-pub async fn cmd_fingerprint(t: Target, sni: String, controls: Vec<String>, repeats: u32) {
+/// Run the whole matrix (TCP perturbations, then UDP/QUIC) against one server address.
+async fn run_fp(t: &Target, sni: &str, controls: &[String], repeats: u32, tag: &str) -> Fp {
     let ms = matrix();
     let total = ms.len();
     let mut cells = vec![];
     for (i, p) in ms.iter().enumerate() {
         if !t.json {
-            eprintln!("[{:>2}/{}] {:<16} {}", i + 1, total, p.key, p.desc);
+            eprintln!("{}[{:>2}/{}] {:<16} {}", tag, i + 1, total, p.key, p.desc);
         }
         let mut tests = vec![];
         let mut ctl = vec![];
         for _ in 0..repeats {
-            tests.push(attempt(&t, &(p.sni)(&sni), &p.shape).await);
+            tests.push(attempt(t, &(p.sni)(sni), &p.shape).await);
         }
-        for c in &controls {
+        for c in controls {
             for _ in 0..repeats {
-                ctl.push(attempt(&t, &(p.sni)(c), &p.shape).await);
+                ctl.push(attempt(t, &(p.sni)(c), &p.shape).await);
             }
         }
         cells.push(Cell { key: p.key, desc: p.desc, tests, ctl });
@@ -208,20 +209,20 @@ pub async fn cmd_fingerprint(t: Target, sni: String, controls: Vec<String>, repe
 
     // UDP / QUIC: a plain datagram, then QUIC Initials for the test and control SNIs.
     if !t.json {
-        eprintln!("[udp/quic] plain UDP and QUIC Initial");
+        eprintln!("{}[udp/quic] plain UDP and QUIC Initial", tag);
     }
     let mut raw = vec![];
     for _ in 0..repeats {
-        raw.push(udp_attempt(&t).await);
+        raw.push(udp_attempt(t).await);
     }
     let mut qtst = vec![];
     for _ in 0..repeats {
-        qtst.push(quic_attempt(&t, &sni).await);
+        qtst.push(quic_attempt(t, sni).await);
     }
     let mut qctl = vec![];
-    for c in &controls {
+    for c in controls {
         for _ in 0..repeats {
-            qctl.push(quic_attempt(&t, c).await);
+            qctl.push(quic_attempt(t, c).await);
         }
     }
     let (quic_token, quic_lines) = quic_class(&raw, &qctl, &qtst);
@@ -261,19 +262,14 @@ pub async fn cmd_fingerprint(t: Target, sni: String, controls: Vec<String>, repe
         let verdict = format!("Profile: {}", tr.iter().map(|x| x.label.as_str()).collect::<Vec<_>>().join(" / "));
         (result, tr, verdict)
     };
+    Fp { cells, result, traits, verdict }
+}
 
+fn report_fp(t: &Target, sni: &str, controls: &[String], repeats: u32, fp: &Fp) {
     if t.json {
-        for c in &cells {
-            for (kind, set) in [("test", &c.tests), ("control", &c.ctl)] {
-                for a in set {
-                    let mut v = serde_json::to_value(a).unwrap();
-                    v["kind"] = json!(kind);
-                    v["perturbation"] = json!(c.key);
-                    println!("{}", v);
-                }
-            }
-        }
-        let matrix: Vec<_> = cells
+        print_attempts(fp, None);
+        let matrix: Vec<_> = fp
+            .cells
             .iter()
             .map(|c| {
                 json!({
@@ -283,18 +279,18 @@ pub async fn cmd_fingerprint(t: Target, sni: String, controls: Vec<String>, repe
                 })
             })
             .collect();
-        let traits_json: Vec<_> = traits.iter().map(|x| json!({"token": x.token, "label": x.label, "text": x.text})).collect();
-        println!("{}", json!({"cmd": "fingerprint", "result": result, "verdict": verdict, "traits": traits_json, "matrix": matrix}));
+        let traits_json: Vec<_> = fp.traits.iter().map(|x| json!({"token": x.token, "label": x.label, "text": x.text})).collect();
+        println!("{}", json!({"cmd": "fingerprint", "result": fp.result, "verdict": fp.verdict, "traits": traits_json, "matrix": matrix}));
         return;
     }
 
     let mut rows = vec![
-        line(format!("target    {}:{}   timeout {}s   repeats {}", t.server, t.port, t.timeout, repeats)),
+        line(format!("target    {}   timeout {}s   repeats {}", t.addr(), t.timeout, repeats)),
         line(format!("controls  {}", controls.join(", "))),
         Row::Sep,
         line(format!("{:<16} {:<38} {:<12} {:<10} {}", "PERTURBATION", "WHAT IS SENT", "TEST", "SERVER", "CONTROL")),
     ];
-    for c in &cells {
+    for c in &fp.cells {
         let (test, color) = if !c.valid() {
             ("n/a".to_string(), ui::YELLOW)
         } else if c.blocked() {
@@ -316,13 +312,113 @@ pub async fn cmd_fingerprint(t: Target, sni: String, controls: Vec<String>, repe
         ));
     }
     rows.push(Row::Sep);
-    let head_color = if traits.is_empty() { ui::YELLOW } else { ui::RED };
-    rows.push(colored(&verdict, head_color));
-    for x in &traits {
+    let head_color = if fp.traits.is_empty() { ui::YELLOW } else { ui::RED };
+    rows.push(colored(&fp.verdict, head_color));
+    for x in &fp.traits {
         rows.push(line(format!("- {}", x.text)));
     }
     rows.push(Row::Sep);
     rows.push(colored("note: observed behaviour compatible with this profile; it does not identify a product,", ui::DIM));
     rows.push(colored("and `~` marks a cell with mixed results (repeat with --repeats 3).", ui::DIM));
     ui::boxed(&format!("fingerprint: {}", sni), &rows);
+}
+
+struct Fp {
+    cells: Vec<Cell>,
+    result: String,
+    traits: Vec<Trait>,
+    verdict: String,
+}
+
+fn print_attempts(fp: &Fp, side: Option<&str>) {
+    for c in &fp.cells {
+        for (kind, set) in [("test", &c.tests), ("control", &c.ctl)] {
+            for a in set {
+                let mut v = serde_json::to_value(a).unwrap();
+                v["kind"] = json!(kind);
+                v["perturbation"] = json!(c.key);
+                if let Some(sd) = side {
+                    v["side"] = json!(sd);
+                }
+                println!("{}", v);
+            }
+        }
+    }
+}
+
+fn cells_differ(a: &Cell, b: &Cell) -> bool {
+    a.valid() != b.valid() || (a.valid() && a.blocked() != b.blocked())
+}
+
+fn cell_text(c: &Cell) -> String {
+    if c.valid() { c.outcomes() } else { "n/a".to_string() }
+}
+
+/// Side-by-side comparison of two fingerprints (typically IPv4 vs IPv6 of one server).
+fn report_compare(sni: &str, ta: &Target, tb: &Target, fa: &Fp, fb: &Fp) {
+    let differing: Vec<&str> = fa.cells.iter().zip(&fb.cells).filter(|(a, b)| cells_differ(a, b)).map(|(a, _)| a.key).collect();
+    let same = differing.is_empty() && fa.result == fb.result;
+    let result = if same { "same" } else { "differs" };
+    let ta_set: BTreeSet<&str> = fa.result.split(',').collect();
+    let tb_set: BTreeSet<&str> = fb.result.split(',').collect();
+
+    if ta.json {
+        print_attempts(fa, Some("a"));
+        print_attempts(fb, Some("b"));
+        println!("{}", json!({"cmd": "fingerprint-compare", "result": result, "a": fa.result, "b": fb.result, "differing": differing}));
+        return;
+    }
+    let (la, lb) = (ta.addr(), tb.addr());
+    let w = la.len().max(lb.len()).max(14);
+    let mut rows = vec![
+        line(format!("A  {}", la)),
+        line(format!("B  {}", lb)),
+        Row::Sep,
+        line(format!("{:<16} {:<w$} {:<w$}", "PERTURBATION", "A", "B", w = w)),
+    ];
+    for (a, b) in fa.cells.iter().zip(&fb.cells) {
+        let d = cells_differ(a, b);
+        let text = format!("{:<16} {:<w$} {:<w$} {}", a.key, cell_text(a), cell_text(b), if d { "<- differs" } else { "" }, w = w);
+        rows.push(if d { colored(text, ui::RED) } else { line(text) });
+    }
+    rows.push(Row::Sep);
+    rows.push(line(format!("A profile: {}", fa.result)));
+    rows.push(line(format!("B profile: {}", fb.result)));
+    rows.push(Row::Sep);
+    if same {
+        rows.push(colored("Same behaviour on both addresses.", ui::GREEN));
+    } else {
+        rows.push(colored("Different behaviour on the two addresses.", ui::RED));
+        if !differing.is_empty() {
+            rows.push(colored(format!("Cells that differ: {}.", differing.join(", ")), ui::RED));
+        }
+        let only_a: Vec<&str> = ta_set.difference(&tb_set).cloned().collect();
+        let only_b: Vec<&str> = tb_set.difference(&ta_set).cloned().collect();
+        if !only_a.is_empty() {
+            rows.push(line(format!("Only on A: {}", only_a.join(", "))));
+        }
+        if !only_b.is_empty() {
+            rows.push(line(format!("Only on B: {}", only_b.join(", "))));
+        }
+    }
+    rows.push(Row::Sep);
+    rows.push(colored("note: a difference means the two paths are treated differently (e.g. IPv6 filtered differently),", ui::DIM));
+    rows.push(colored("not that either is \"the real\" behaviour.", ui::DIM));
+    ui::boxed(&format!("fingerprint compare: {}", sni), &rows);
+}
+
+pub async fn cmd_fingerprint(t: Target, sni: String, controls: Vec<String>, repeats: u32, compare: Option<String>) {
+    match compare {
+        None => {
+            let fp = run_fp(&t, &sni, &controls, repeats, "").await;
+            report_fp(&t, &sni, &controls, repeats, &fp);
+        }
+        Some(other) => {
+            let mut tb = t.clone();
+            tb.server = other;
+            let fa = run_fp(&t, &sni, &controls, repeats, "A ").await;
+            let fb = run_fp(&tb, &sni, &controls, repeats, "B ").await;
+            report_compare(&sni, &t, &tb, &fa, &fb);
+        }
+    }
 }

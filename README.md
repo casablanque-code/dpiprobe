@@ -41,6 +41,10 @@ the forward path" or "the first segment was delivered and the flow was reset aft
 | `dpiprobe threshold` | After how many uploaded bytes does it cut the flow? |
 | `dpiprobe server` | The ground-truth side. Run it outside the network under test. |
 
+Everything works over IPv4 and IPv6 (`--server` takes either). `dpiprobe fingerprint --compare-server ADDR`
+fingerprints a second address of the same server, typically its IPv6 address, and shows where the two
+paths are treated differently; in real networks IPv6 is often filtered differently or not at all.
+
 Add `--json` to any measurement for machine-readable output (per-attempt evidence plus
 a final line with `result`, `verdict` and `features`). `dpiprobe <command> --help` lists all options.
 
@@ -60,6 +64,7 @@ middlebox, so every measurement can be validated against a configuration you cho
 ```
   cl (probe)  --- dpi (NFQUEUE middlebox, lab/dpi_sim.py) ---  sv (dpiprobe server)
   10.0.1.2        10.0.1.1 | 10.0.2.1                          10.0.2.2
+  fd00:1::2       fd00:1::1 | fd00:2::1                        fd00:2::2
 ```
 
 ```bash
@@ -67,6 +72,8 @@ dpi doctor            # check prerequisites
 dpi on sni-drop       # start the lab with a profile
 dpi probe             # measure it
 dpi test              # run the whole validation table (lab/tests.tsv)
+dpi test --both       # ... over IPv4 and IPv6
+dpi -6 fingerprint    # any command over IPv6
 dpi help              # everything else
 ```
 

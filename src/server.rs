@@ -124,29 +124,67 @@ async fn ctl_conn(s: TcpStream, st: State) {
     }
 }
 
+/// Addresses to bind for `addr`. A wildcard IPv6 address ("[::]:PORT") also tries the
+/// IPv4 wildcard: on a dual-stack host the second bind simply fails and is ignored,
+/// on a v6-only host it keeps IPv4 working.
+fn variants(addr: &str) -> Vec<String> {
+    match addr.strip_prefix("[::]:") {
+        Some(port) => vec![addr.to_string(), format!("0.0.0.0:{port}")],
+        None => vec![addr.to_string()],
+    }
+}
+
+async fn bind_tcp(addr: &str) -> Vec<TcpListener> {
+    let mut out = vec![];
+    let mut last = None;
+    for a in variants(addr) {
+        match TcpListener::bind(&a).await {
+            Ok(l) => out.push(l),
+            Err(e) => last = Some(e),
+        }
+    }
+    if out.is_empty() {
+        fatal(addr, last.expect("an error"));
+    }
+    out
+}
+
 pub async fn run(data: String, ctl: String) {
     let st: State = Default::default();
-    let d = TcpListener::bind(&data).await.unwrap_or_else(|e| fatal(&data, e));
-    let c = TcpListener::bind(&ctl).await.unwrap_or_else(|e| fatal(&ctl, e));
-    let st2 = st.clone();
-    tokio::spawn(async move {
-        loop {
-            if let Ok((s, _)) = c.accept().await {
-                tokio::spawn(ctl_conn(s, st2.clone()));
+    for c in bind_tcp(&ctl).await {
+        let st2 = st.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((s, _)) = c.accept().await {
+                    tokio::spawn(ctl_conn(s, st2.clone()));
+                }
             }
-        }
-    });
-    match UdpSocket::bind(&data).await {
-        Ok(sock) => {
+        });
+    }
+    let mut udp = 0;
+    for a in variants(&data) {
+        if let Ok(sock) = UdpSocket::bind(&a).await {
+            udp += 1;
             tokio::spawn(udp_loop(sock, st.clone()));
         }
-        Err(e) => eprintln!("warning: UDP {data} unavailable ({e}); QUIC/UDP measurements will not work"),
+    }
+    if udp == 0 {
+        eprintln!("warning: UDP {data} unavailable; QUIC/UDP measurements will not work");
+    }
+    let mut accepts = vec![];
+    for d in bind_tcp(&data).await {
+        let st2 = st.clone();
+        accepts.push(tokio::spawn(async move {
+            loop {
+                if let Ok((s, p)) = d.accept().await {
+                    tokio::spawn(data_conn(s, p, st2.clone()));
+                }
+            }
+        }));
     }
     eprintln!("listening data={data} ctl={ctl}");
-    loop {
-        if let Ok((s, p)) = d.accept().await {
-            tokio::spawn(data_conn(s, p, st.clone()));
-        }
+    for h in accepts {
+        let _ = h.await;
     }
 }
 

@@ -18,7 +18,7 @@ use probe::{Shape, Target};
 #[command(
     name = "dpiprobe",
     about = "Controlled DPI probe with ground truth: a client plus a server that records what really arrived.",
-    after_help = "EXAMPLES:\n  dpiprobe server\n  dpiprobe probe --server 203.0.113.5 --test-sni blocked.example\n  dpiprobe probe --server 203.0.113.5 --test-sni blocked.example --split-sni\n  dpiprobe depth --server 203.0.113.5 --sni blocked.example\n  dpiprobe fingerprint --server 203.0.113.5 --sni blocked.example\n  dpiprobe threshold --server 203.0.113.5"
+    after_help = "EXAMPLES:\n  dpiprobe server\n  dpiprobe probe --server 203.0.113.5 --test-sni blocked.example\n  dpiprobe probe --server 203.0.113.5 --test-sni blocked.example --split-sni\n  dpiprobe depth --server 203.0.113.5 --sni blocked.example\n  dpiprobe fingerprint --server 203.0.113.5 --sni blocked.example\n  dpiprobe fingerprint --server 203.0.113.5 --sni blocked.example --compare-server 2001:db8::5\n  dpiprobe threshold --server 203.0.113.5"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,11 +29,11 @@ struct Cli {
 enum Cmd {
     /// Run the ground-truth server (the machine outside the censored network)
     Server {
-        /// Data listener (probe traffic)
-        #[arg(long, default_value = "0.0.0.0:443")]
+        /// Data listener (probe traffic); [::] also covers IPv4 where possible
+        #[arg(long, default_value = "[::]:443")]
         data: String,
         /// Control listener (ground-truth queries)
-        #[arg(long, default_value = "0.0.0.0:9001")]
+        #[arg(long, default_value = "[::]:9001")]
         ctl: String,
     },
     /// Compare a test SNI against a control SNI and classify the reaction (rst, drop, ...)
@@ -99,6 +99,10 @@ enum Cmd {
         /// Attempts per cell
         #[arg(long, default_value_t = 1)]
         repeats: u32,
+        /// Also fingerprint this other server address (e.g. the IPv6 address of the same server)
+        /// and show where the two behave differently
+        #[arg(long)]
+        compare_server: Option<String>,
     },
     /// Measure the upload cutoff: after how many bytes the middlebox kills or freezes the flow
     Threshold {
@@ -126,8 +130,8 @@ async fn main() {
         Cmd::Depth { t, sni, control_sni, max_pad } => probe::cmd_depth(t, sni, control_sni, max_pad).await,
         Cmd::Quic { t, sni, control_sni, repeats } => probe::cmd_quic(t, control_sni, sni, repeats).await,
         Cmd::Initial { sni } => println!("{}", wire::hex(&quic::fixture_initial(&sni))),
-        Cmd::Fingerprint { t, sni, control_sni, repeats } => {
-            fingerprint::cmd_fingerprint(t, sni, control_sni, repeats).await
+        Cmd::Fingerprint { t, sni, control_sni, repeats, compare_server } => {
+            fingerprint::cmd_fingerprint(t, sni, control_sni, repeats, compare_server).await
         }
         Cmd::Threshold { t, sni, max_kb, chunk } => probe::cmd_threshold(t, sni, max_kb, chunk).await,
     }

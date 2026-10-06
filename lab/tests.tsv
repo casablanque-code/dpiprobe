@@ -3,6 +3,8 @@
 #   depth     -> depth=N | not_blocked
 #   threshold -> cutoff=NKB | cutoff=none
 #   quic      -> quic=unaffected | quic=sni-drop | quic=sni-icmp | quic=blocked-all | udp=blocked
+#   profile@4 / profile@6 -> row runs for one IP family only
+#   fingerprint --compare-server @other -> same | differs  (this IP family vs the other one)
 #   fingerprint -> traits: reaction,reassembly,case,depth,scan[,evades-header-split][,sni-position-sensitive]
 sni-rst           | probe --test-sni blocked.example --repeats 2                | rst
 sni-rst           | probe --test-sni other.example --repeats 2                  | tls_alert
@@ -29,3 +31,7 @@ quic-initial-drop | quic --sni blocked.example --repeats 2                      
 quic-udp-drop     | quic --sni blocked.example --repeats 2                      | udp=blocked
 quic-sni-drop     | fingerprint --sni blocked.example                           | tcp=unaffected,quic=sni-drop
 sni-rst-quic-drop | fingerprint --sni blocked.example                           | rst,stateless,case-sensitive,depth=3,deep-scan,quic=sni-drop
+sni-rst           | fingerprint --sni blocked.example --compare-server @other   | same
+sni-rst-v4only    | fingerprint --sni blocked.example --compare-server @other   | differs
+sni-rst-v4only@4  | probe --test-sni blocked.example --repeats 2                | rst
+sni-rst-v4only@6  | probe --test-sni blocked.example --repeats 2                | tls_alert

@@ -5,7 +5,10 @@ REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 BIN=${DPI_BIN:-$REPO/target/release/dpiprobe}
 PY=${DPI_PY:-/root/lab/venv/bin/python}
 RUN=/run/dpi
-SRV=10.0.2.2
+SRV4=10.0.2.2
+SRV6=fd00:2::2
+SRV=$SRV4
+FAMS=4
 
 die() { echo "error: $*" >&2; exit 1; }
 alive() { [[ -f $1 ]] && kill -0 "$(cat "$1")" 2>/dev/null; }
@@ -71,8 +74,21 @@ PY
 cfg_build() { local base=$1; shift; python3 -c "$PYCFG" "$base" "$RUN/dpi.json" "$@"; }
 cfg_show() { [[ -f $RUN/dpi.json ]] && python3 -c "$PYSHOW" "$RUN/dpi.json"; }
 
+# IPv6 addressing of the lab (fd00:1::/64 client side, fd00:2::/64 server side). Idempotent.
+lab_v6() {
+  [[ -e /proc/net/if_inet6 ]] || return 0
+  nsx cl ip -6 addr show dev c0 2>/dev/null | grep -q 'fd00:1::2' && return 0
+  nsx cl ip -6 addr add fd00:1::2/64 dev c0 nodad 2>/dev/null || return 0
+  nsx dpi ip -6 addr add fd00:1::1/64 dev d0 nodad
+  nsx dpi ip -6 addr add fd00:2::1/64 dev d1 nodad
+  nsx sv ip -6 addr add fd00:2::2/64 dev s0 nodad
+  nsx cl ip -6 route add default via fd00:1::1
+  nsx sv ip -6 route add default via fd00:2::1
+  nsx dpi sysctl -qw net.ipv6.conf.all.forwarding=1
+}
+
 lab_up() {
-  [[ -e /run/netns/cl && -e /run/netns/dpi && -e /run/netns/sv ]] && return 0
+  if [[ -e /run/netns/cl && -e /run/netns/dpi && -e /run/netns/sv ]]; then lab_v6; return 0; fi
   local n; for n in cl dpi sv; do ip netns del $n 2>/dev/null; done
   ip netns add cl; ip netns add dpi; ip netns add sv
   ip link add c0 type veth peer name d0
@@ -89,6 +105,7 @@ lab_up() {
   nsx cl ip route add default via 10.0.1.1
   nsx sv ip route add default via 10.0.2.1
   nsx dpi sysctl -qw net.ipv4.ip_forward=1
+  lab_v6
 }
 
 # The nft rule that sends forwarded TCP to the DPI process. Removing it makes the lab transparent.
@@ -193,27 +210,32 @@ run_tool() {
 }
 
 cmd_test() {
-  local filter=${1:-} pass=0 fail=0 prof args exp out res st cur t0=$SECONDS
+  local filter=${1:-} pass=0 fail=0 prof args exp out res st cur fam srv other t0=$SECONDS
   local tests=$REPO/lab/tests.tsv
   [[ -f $tests ]] || die "missing $tests"
   lab_up; server_on
-  while IFS='|' read -r -u 3 prof args exp; do
-    prof=$(echo $prof); args=$(echo $args); exp=$(echo $exp)
-    [[ -z $prof || $prof == \#* ]] && continue
-    [[ -n $filter && "$prof $args" != *$filter* ]] && continue
-    cur=$(cat "$RUN/profile" 2>/dev/null)
-    if [[ $cur != "$prof" ]] || ! alive "$RUN/dpi.pid"; then
-      [[ -f $REPO/lab/profiles/$prof.json ]] || die "no such profile '$prof' (test: $args)"
-      cfg_build "$REPO/lab/profiles/$prof.json"; echo "$prof" > "$RUN/profile"; dpi_start
-    fi
-    out=$(nsx cl "$BIN" $args --server $SRV --timeout 2 --json 2>&1)
-    res=$(printf '%s\n' "$out" | python3 -c "$PYCHK" "$exp")
-    st=${res%% *}
-    [[ $st == PASS ]] && pass=$((pass + 1)) || fail=$((fail + 1))
-    printf '%-4s  %-18s %-60s want=%-12s %s\n' "$st" "$prof" "$args" "$exp" "${res#* }"
-  done 3< "$tests"
+  for fam in $FAMS; do
+    if [[ $fam == 6 ]]; then srv=$SRV6; other=$SRV4; else srv=$SRV4; other=$SRV6; fi
+    while IFS='|' read -r -u 3 prof args exp; do
+      prof=$(echo $prof); args=$(echo $args); exp=$(echo $exp)
+      [[ -z $prof || $prof == \#* ]] && continue
+      if [[ $prof == *@* ]]; then [[ ${prof#*@} == "$fam" ]] || continue; prof=${prof%@*}; fi   # name@4 / name@6: one family only
+      [[ -n $filter && "$prof $args" != *$filter* ]] && continue
+      cur=$(cat "$RUN/profile" 2>/dev/null)
+      if [[ $cur != "$prof" ]] || ! alive "$RUN/dpi.pid"; then
+        [[ -f $REPO/lab/profiles/$prof.json ]] || die "no such profile '$prof' (test: $args)"
+        cfg_build "$REPO/lab/profiles/$prof.json"; echo "$prof" > "$RUN/profile"; dpi_start
+      fi
+      args=${args//@other/$other}   # @other = the server address of the other IP family
+      out=$(nsx cl "$BIN" $args --server $srv --timeout 2 --json 2>&1)
+      res=$(printf '%s\n' "$out" | python3 -c "$PYCHK" "$exp")
+      st=${res%% *}
+      [[ $st == PASS ]] && pass=$((pass + 1)) || fail=$((fail + 1))
+      printf '%-4s  v%s  %-18s %-60s want=%-12s %s\n' "$st" "$fam" "$prof" "$args" "$exp" "${res#* }"
+    done 3< "$tests"
+  done
   echo
-  box "dpi test" "passed  $pass" "failed  $fail" "time    $((SECONDS - t0))s"
+  box "dpi test" "passed  $pass" "failed  $fail" "time    $((SECONDS - t0))s" "ip      v${FAMS// / + v}"
   [[ $fail -eq 0 ]]
 }
 
@@ -234,6 +256,7 @@ cmd_doctor() {
   chk "DPI python has cryptography (QUIC profiles)" '"$PY" -c "import cryptography"'
   chk "dpiprobe built ($BIN)"              '[[ -x $BIN ]]'
   chk "lab/dpi_sim.py present"             '[[ -f $REPO/lab/dpi_sim.py ]]'
+  chk "IPv6 available on this host"        '[[ -e /proc/net/if_inet6 ]]'
   chk "network namespaces usable"          'ip netns list'
   box "dpi doctor" "${rows[@]}"
   return $bad
@@ -263,10 +286,17 @@ MEASUREMENTS (run from the client side of the lab)
   dpi quic [opts]             UDP/QUIC 443: plain UDP, then QUIC Initials with the test and control SNI
   dpi depth [opts]            how many client packets does the DPI inspect?
   dpi threshold [opts]        after how many uploaded bytes does the DPI cut the flow?
-  Every option of `dpiprobe <command> --help` works here.
+  Every option of `dpiprobe <command> --help` works here. To compare IPv4 with IPv6 behaviour:
+  dpi fingerprint --compare-server fd00:2::2
+
+IP FAMILY (works with every command, anywhere in the line)
+  -4 / -6 / --both            use the IPv4 (default) or IPv6 server address; --both runs `dpi test` for both
+                              e.g. dpi -6 fingerprint     dpi test --both
 
 TESTS
   dpi test [filter]           run lab/tests.tsv: each row is  profile | dpiprobe args | expected result
+                              "@other" in the args = the server address of the other IP family;
+                              a profile written as name@4 or name@6 runs for that family only
                               expected: probe -> tls_alert|rst|timeout, depth -> depth=N,
                               threshold -> cutoff=NKB|cutoff=none,
                               quic -> quic=unaffected|sni-drop|sni-icmp|blocked-all, udp=blocked,
@@ -278,6 +308,17 @@ TYPICAL SESSION
 H
 }
 
+args=()
+for a in "$@"; do
+  case $a in
+    -6) FAMS=6 ;;
+    -4) FAMS=4 ;;
+    --both) FAMS="4 6" ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]+"${args[@]}"}"
+[[ ${FAMS%% *} == 6 ]] && SRV=$SRV6
 [[ ${1:-help} =~ ^(help|-h|--help)$ ]] && { cmd_help; exit 0; }
 [[ $EUID -eq 0 ]] || die "must run as root"
 mkdir -p "$RUN"
